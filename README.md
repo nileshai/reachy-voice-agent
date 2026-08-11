@@ -34,6 +34,11 @@ required locally; a laptop on the same network as the robot is enough.
   transcript, and start/stop.
 - **Expressive motion** — head and antennas animate differently when idle,
   listening, thinking, and speaking.
+- **Voice movement control** — "turn 30 degrees right", "look up", "show me a
+  happy emotion", "do a little dance". The LLM calls real tools against the
+  robot; 81 emotions are reachable by plain English name.
+- **Optional agent delegation** — hand tasks to an external agent CLI (files,
+  web, shell). Off by default; see the warning below.
 
 ### Measured latency
 
@@ -184,6 +189,48 @@ Parakeet reliably renders "Reachy" as **"Rich"**. Wake matching therefore
 accepts a set of variants, and when the local gate has already confirmed the
 phrase, a second cloud-side match is *not* required — demanding one rejects
 valid wakes.
+
+### Voice movement control
+
+The LLM is given four robot tools — `move_head`, `turn_body`, `play_emotion`,
+`reset_pose` — and calls them when you ask it to move. A request like "look
+right and show a curious emotion" produces two calls in one turn.
+
+Three things this needed that aren't obvious:
+
+- **Model choice is a hard constraint.** `mistral-nemotron` is the fastest
+  model here but returns `tool_calls: []` and explains what it *would* do — the
+  robot never moves. `gpt-oss-120b` nests arguments wrongly
+  (`{"degrees": {"yaw_deg": -30}}`). `llama-3.1-8b-instruct` is the default
+  because it emits correct calls at usable latency.
+- **Arguments arrive as strings.** Models emit `"5"` rather than `5` often
+  enough that every numeric argument is coerced before use; unexpected and
+  nested keys are dropped rather than passed through.
+- **Tool results are phrased for speech.** The model routinely echoes a tool's
+  return value verbatim as its spoken reply, so results read "looking up", not
+  "head to yaw 0, pitch -25, roll 0".
+
+Emotion names are resolved through a synonym map: the library has `cheerful1`,
+not `happy`, and no amount of fuzzy spelling matching bridges that.
+
+Pitch direction was verified on hardware rather than assumed — positive pitch
+aims the camera **down**, confirmed by pointing the head at ±35° and asking the
+vision model which way it was looking.
+
+### Agent delegation (off by default)
+
+`run_agent` hands a task to an external CLI, set by `REACHY_AGENT_CMD`
+(default `claude -p`):
+
+```bash
+REACHY_AGENT_ENABLED=1 REACHY_AGENT_CMD="claude -p" .venv/bin/python voice_agent.py
+```
+
+> **Think before enabling this.** It turns anything sayable within earshot into
+> a command on your machine, with no authentication and no confirmation step.
+> Anyone who can speak near the robot can drive it — and with a wake word as
+> loose as `hey`, so can a podcast. Enable it only when you are alone and know
+> exactly what your agent CLI is permitted to do.
 
 ### Speech and vision on separate clocks
 

@@ -38,6 +38,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -69,8 +70,12 @@ FN_ASR_WHISPER = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"   # ai-whisper-large-v3
 FN_TTS_MAGPIE = "877104f7-e885-42b9-8de8-f6e4c6303969"    # ai-magpie-tts-multilingual
 FN_TTS_CHATTERBOX = "ddacc747-1269-4fab-bfd9-8f593dead106"  # ai-chatterbox-multilingual-tts
 
-# Measured latencies: mistral-nemotron 0.41s, llama-3.1-8b 1.15s, 70b timed out.
-LLM_MODEL = os.environ.get("REACHY_LLM", "mistralai/mistral-nemotron")
+# llama-3.1-8b is the default because it is the fastest model tested that
+# reliably emits tool calls. mistral-nemotron answers faster (0.41s vs 1.15s)
+# but returns `tool_calls: []` and explains itself instead of acting, so the
+# robot cannot be driven by voice with it. gpt-oss-120b nests the arguments
+# wrongly. Set REACHY_LLM=mistralai/mistral-nemotron for chat-only, no control.
+LLM_MODEL = os.environ.get("REACHY_LLM", "meta/llama-3.1-8b-instruct")
 VLM_MODEL = os.environ.get("REACHY_VLM", "nvidia/nemotron-nano-12b-v2-vl")
 
 TTS_FUNCTION = FN_TTS_MAGPIE
@@ -83,6 +88,15 @@ EMOTIONS_DATASET = "pollen-robotics/reachy-mini-emotions-library"
 # synthesis result cannot be amplified into a wall of noise.
 TTS_PEAK_TARGET = float(os.environ.get("REACHY_TTS_PEAK", 0.97))
 TTS_MAX_GAIN = float(os.environ.get("REACHY_TTS_MAX_GAIN", 8.0))
+
+# External agent delegation (files, web, shell). OFF by default and
+# deliberately so: with it on, anything said within earshot of the robot
+# becomes a command executed on this machine, unauthenticated. Enable only
+# when you are alone and understand what the agent CLI is permitted to do.
+AGENT_ENABLED = os.environ.get("REACHY_AGENT_ENABLED", "") not in ("", "0", "false")
+AGENT_CMD = shlex.split(os.environ.get("REACHY_AGENT_CMD", "claude -p"))
+AGENT_TIMEOUT = float(os.environ.get("REACHY_AGENT_TIMEOUT", 120))
+AGENT_MAX_CHARS = int(os.environ.get("REACHY_AGENT_MAX_CHARS", 700))
 
 # Audio constants. Rates are fixed by the pipeline, not preferences.
 RATE = 16000
@@ -141,13 +155,27 @@ LOCAL_WAKE_MODEL = os.environ.get("REACHY_LOCAL_WAKE_MODEL", "tiny.en")
 CONVERSATION_WINDOW_S = 25.0
 VISION_INTERVAL_S = 3.0
 
+# A tool call may itself trigger a follow-up call ("turn right and look
+# happy"), so allow a few hops -- but cap them, or a model that keeps calling
+# tools will spin.
+MAX_TOOL_HOPS = int(os.environ.get("REACHY_MAX_TOOL_HOPS", 4))
+
 SYSTEM_PROMPT = (
-    "You are Reachy Mini, a small expressive desk robot with a camera and "
-    "microphones. You are speaking out loud, so reply in ONE or TWO short "
-    "spoken sentences. Never use markdown, lists, or emoji. Be warm and "
-    "concrete. You are given a live description of what your camera currently "
-    "sees; use it naturally when it is relevant, and do not mention that you "
-    "were given a description."
+    "You are Reachy Mini, a small expressive desk robot with a camera, "
+    "microphones, a movable head and antennas. You are speaking out loud, so "
+    "reply in ONE or TWO short spoken sentences. Never use markdown, lists, or "
+    "emoji. Be warm and concrete.\n\n"
+    "You have tools that move your body. When the user asks you to move, turn, "
+    "look somewhere, dance, or show an emotion, CALL THE TOOL -- do not merely "
+    "describe what you would do. From the user's point of view, 'right' means "
+    "your right, which is negative yaw. After a tool runs, confirm briefly in "
+    "one short sentence.\n\n"
+    "Only call a tool to MOVE. Questions about what you can see, or ordinary "
+    "conversation, are answered in words with no tool call at all. Never "
+    "invent a tool that is not in your list.\n\n"
+    "You are given a live description of what your camera currently sees; use "
+    "it naturally when relevant, and never mention that you were given a "
+    "description."
 )
 
 
@@ -261,18 +289,107 @@ class Brain:
         r.raise_for_status()
         return (r.json()["choices"][0]["message"].get("content") or "").strip()
 
-    def reply(self, history: list[dict], world: str) -> str:
+    def _post(self, messages: list[dict], tools: list[dict] | None) -> dict:
+        body = {"model": LLM_MODEL, "max_tokens": 200, "temperature": 0.4,
+                "messages": messages}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        r = self.http.post("/chat/completions", json=body)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]
+
+    @staticmethod
+    def _confirm(done: list[str]) -> str:
+        """Spoken confirmation built from what actually ran.
+
+        Used when the model cannot produce a closing sentence. The physical
+        action has already happened by then, so failing the whole turn would
+        leave the robot moved but mute.
+        """
+        if not done:
+            return "Done."
+        if len(done) == 1:
+            return f"Okay, {done[0]}."
+        return "Okay, " + ", then ".join(done) + "."
+
+    def reply(self, history: list[dict], world: str,
+              on_tool=None) -> str:
+        """One turn, resolving tool calls before answering.
+
+        Loops because a request like "turn right and look happy" produces two
+        calls; capped so a model that keeps calling tools cannot spin forever.
+        """
         sys_msg = SYSTEM_PROMPT
         if world:
             sys_msg += f"\n\nYour camera currently sees: {world}"
-        r = self.http.post("/chat/completions", json={
-            "model": LLM_MODEL, "max_tokens": 120, "temperature": 0.7,
-            "messages": [{"role": "system", "content": sys_msg}] + history,
-        })
-        r.raise_for_status()
-        msg = r.json()["choices"][0]["message"]
-        # Reasoning models put prose in reasoning_content and leave content empty.
-        return (msg.get("content") or "").strip()
+        msgs = [{"role": "system", "content": sys_msg}] + list(history)
+        tools = tool_schema()
+        done: list[str] = []
+
+        for _ in range(MAX_TOOL_HOPS):
+            try:
+                msg = self._post(msgs, tools)
+            except httpx.HTTPStatusError as e:
+                # The endpoint intermittently 500s on longer tool histories.
+                # Retry once; if it still fails but tools already ran, speak
+                # the confirmation rather than dropping the turn.
+                if e.response.status_code < 500:
+                    raise
+                try:
+                    msg = self._post(msgs, tools)
+                except Exception:
+                    if done:
+                        return self._confirm(done)
+                    raise
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                # Reasoning models put prose in reasoning_content, leaving
+                # content empty; fall back so the robot still says something.
+                text = ((msg.get("content") or "").strip()
+                        or (msg.get("reasoning_content") or "").strip())
+                # After a tool runs, models sometimes echo the raw result
+                # instead of speaking. Spoken aloud that is literal JSON.
+                if done and (not text or text.startswith(("{", "["))):
+                    return self._confirm(done)
+                # Models often quote a tool result verbatim; the quote marks
+                # are noise once this is spoken aloud.
+                return text.strip().strip('"').strip("'").strip()
+            msgs.append({"role": "assistant", "content": msg.get("content") or "",
+                         "tool_calls": calls})
+            for c in calls:
+                fn = c.get("function", {})
+                name = fn.get("name", "")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                skill = SKILLS.get(name)
+                if skill is None:
+                    # List the real ones: models invent plausible tools
+                    # (look_at, set_volume) and retry the same invention
+                    # unless told what actually exists.
+                    result = (f"no such tool {name!r}. Available tools: "
+                              + ", ".join(t["function"]["name"] for t in tools)
+                              + ". If none fit, just answer in words.")
+                else:
+                    try:
+                        # Drop unexpected keys: models occasionally invent or
+                        # nest arguments (gpt-oss wraps them in "degrees").
+                        import inspect
+                        ok = set(inspect.signature(skill).parameters)
+                        result = skill(**{k: v for k, v in args.items() if k in ok})
+                    except Exception as e:
+                        result = f"{name} failed: {type(e).__name__}: {e}"
+                if on_tool:
+                    on_tool(name, args, result)
+                if skill is not None and not str(result).startswith("no such"):
+                    done.append(str(result))
+                msgs.append({"role": "tool", "tool_call_id": c.get("id", ""),
+                             "name": name, "content": str(result)})
+        return self._confirm(done)
 
 
 # ---------------------------------------------------------- local wake detection
@@ -441,6 +558,233 @@ def play_wav(wav_bytes: bytes, name: str = "_reachy_voice.wav") -> float:
         c.post("/api/media/play_sound", json={"file": name}).raise_for_status()
     with wave.open(io.BytesIO(wav_bytes)) as w:
         return w.getnframes() / w.getframerate()
+
+
+# ------------------------------------------------------------ robot skills
+# Tools the LLM can call. Kept deliberately small and physical: each maps to
+# one robot action with bounded arguments, so a mis-parsed argument cannot
+# drive the hardware somewhere unreasonable.
+
+EMOTIONS: list[str] = []       # filled lazily from the robot
+
+
+def emotion_names() -> list[str]:
+    global EMOTIONS
+    if not EMOTIONS:
+        try:
+            r = httpx.get(
+                f"{ROBOT}/api/move/recorded-move-datasets/list/"
+                f"{quote(EMOTIONS_DATASET, safe='')}", timeout=15)
+            data = r.json()
+            EMOTIONS = data if isinstance(data, list) else data.get("moves", [])
+        except Exception:
+            EMOTIONS = []
+    return EMOTIONS
+
+
+def _clamp(v, lo: float, hi: float) -> float:
+    """Clamp, coercing first.
+
+    Models frequently emit numbers as JSON strings ("5" rather than 5), which
+    would otherwise raise TypeError inside the comparison.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        f = 0.0
+    return max(lo, min(hi, f))
+
+
+# ASR gives plain words; the library uses names like "cheerful1". Without this
+# map, "show me a happy emotion" finds nothing -- there is no entry called
+# "happy" and fuzzy spelling matching cannot bridge a synonym.
+EMOTION_ALIASES = {
+    "happy": "cheerful1", "joy": "cheerful1", "joyful": "cheerful1",
+    "glad": "cheerful1", "cheer": "cheerful1", "smile": "cheerful1",
+    "excited": "enthusiastic1", "enthusiastic": "enthusiastic1",
+    "sad": "sad1", "unhappy": "sad1", "upset": "downcast1", "cry": "sad2",
+    "angry": "furious1", "mad": "rage1", "annoyed": "irritated1",
+    "surprised": "surprised1", "shocked": "amazed1", "amazed": "amazed1",
+    "curious": "curious1", "confused": "confused1", "puzzled": "uncertain1",
+    "tired": "tired1", "sleepy": "sleep1", "sleep": "sleep1",
+    "bored": "boredom1", "proud": "proud1", "laugh": "laughing1",
+    "laughing": "laughing1", "funny": "laughing1",
+    "dance": "dance1", "dancing": "dance1",
+    "yes": "yes1", "nod": "yes1", "agree": "yes1",
+    "no": "no1", "shake": "no1", "disagree": "no1",
+    "hello": "welcoming1", "hi": "welcoming1", "greet": "welcoming1",
+    "welcome": "welcoming1", "wave": "welcoming1",
+    "scared": "scared1", "afraid": "fear1", "anxious": "anxiety1",
+    "love": "loving1", "grateful": "grateful1", "thanks": "grateful1",
+    "sorry": "oops1", "oops": "oops1", "think": "thoughtful1",
+    "thinking": "thoughtful1", "calm": "calming1", "relief": "relief1",
+    "success": "success1", "win": "success1", "shy": "shy1",
+    "lonely": "lonely1", "disgusted": "disgusted1", "hello_there": "welcoming1",
+}
+
+
+def skill_move_head(yaw_deg: float = 0.0, pitch_deg: float = 0.0,
+                    roll_deg: float = 0.0, duration: float = 1.0) -> str:
+    """Absolute head pose. Limits mirror the robot's usable range."""
+    import math
+    # Coerce up front, not just inside _clamp: the values are echoed back in
+    # the confirmation string, and a JSON-string argument would blow up there.
+    yaw_deg = _clamp(yaw_deg, -70, 70)
+    pitch_deg = _clamp(pitch_deg, -35, 35)
+    roll_deg = _clamp(roll_deg, -35, 35)
+    yaw, pitch, roll = map(math.radians, (yaw_deg, pitch_deg, roll_deg))
+    httpx.post(f"{ROBOT}/api/move/goto", timeout=15, json={
+        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0,
+                      "roll": roll, "pitch": pitch, "yaw": yaw},
+        "duration": _clamp(duration, 0.3, 4.0), "interpolation": "minjerk",
+    })
+    # Phrased for speech, not for logs: the model frequently echoes a tool
+    # result verbatim as its spoken reply, and "yaw -40, pitch 0" read aloud
+    # sounds like a machine reciting telemetry.
+    where = []
+    if yaw_deg > 5:
+        where.append("left")
+    elif yaw_deg < -5:
+        where.append("right")
+    if pitch_deg < -5:
+        where.append("up")
+    elif pitch_deg > 5:
+        where.append("down")
+    return "looking " + " and ".join(where) if where else "looking straight ahead"
+
+
+def skill_turn_body(yaw_deg: float = 0.0, duration: float = 1.5) -> str:
+    import math
+    yaw_deg = _clamp(yaw_deg, -160, 160)
+    yaw = math.radians(yaw_deg)
+    httpx.post(f"{ROBOT}/api/move/goto", timeout=15, json={
+        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0,
+                      "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        "body_yaw": yaw, "duration": _clamp(duration, 0.5, 5.0),
+        "interpolation": "minjerk",
+    })
+    side = "left" if yaw_deg > 0 else "right"
+    return f"turned {abs(yaw_deg):.0f} degrees to the {side}"
+
+
+def skill_play_emotion(name: str = "") -> str:
+    """Emotion by name, with fuzzy matching -- ASR will not produce 'curious1'."""
+    import difflib
+    names = emotion_names()
+    if not names:
+        return "emotion library unavailable"
+    want = (name or "").strip().lower().replace(" ", "_")
+    match = None
+    if want in names:
+        match = want
+    elif want in EMOTION_ALIASES and EMOTION_ALIASES[want] in names:
+        match = EMOTION_ALIASES[want]                       # synonym
+    elif want:
+        # 'curious' -> 'curious1'; then fall back to nearest spelling.
+        prefixed = [n for n in names if n.lower().startswith(want)]
+        close = difflib.get_close_matches(want, names, n=1, cutoff=0.6)
+        match = prefixed[0] if prefixed else (close[0] if close else None)
+    if not match:
+        return f"no emotion matching {name!r}"
+    play_emotion(match)
+    # Strip the trailing index: "cheerful1" spoken aloud is odd.
+    return f"showing {re.sub(r'[0-9]+$', '', match).replace('_', ' ')}"
+
+
+def skill_reset_pose() -> str:
+    httpx.post(f"{ROBOT}/api/move/goto", timeout=15, json={
+        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0,
+                      "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        "antennas": [0.0, 0.0], "body_yaw": 0.0, "duration": 1.5,
+    })
+    return "back to neutral"
+
+
+def skill_run_agent(task: str = "") -> str:
+    """Hand a task to an external agent CLI (files, web, shell, etc.).
+
+    Disabled unless REACHY_AGENT_ENABLED=1. This turns anything sayable within
+    earshot of the robot into a command on your machine, with no authentication
+    -- so it is opt-in, not a default.
+    """
+    if not AGENT_ENABLED:
+        return ("the agent tool is disabled; set REACHY_AGENT_ENABLED=1 "
+                "to allow it")
+    if not task.strip():
+        return "no task given"
+    try:
+        proc = subprocess.run(
+            AGENT_CMD + [task], capture_output=True, text=True,
+            timeout=AGENT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"the agent did not finish within {AGENT_TIMEOUT} seconds"
+    except FileNotFoundError:
+        return f"agent command not found: {AGENT_CMD[0]}"
+    out = (proc.stdout or proc.stderr or "").strip()
+    return out[:AGENT_MAX_CHARS] or "the agent returned nothing"
+
+
+SKILLS = {
+    "move_head": skill_move_head,
+    "turn_body": skill_turn_body,
+    "play_emotion": skill_play_emotion,
+    "reset_pose": skill_reset_pose,
+    "run_agent": skill_run_agent,
+}
+
+
+def tool_schema() -> list[dict]:
+    tools = [
+        {"type": "function", "function": {
+            "name": "move_head",
+            "description": "Turn or tilt the robot's head to an absolute pose. "
+                           "Positive yaw is LEFT, negative yaw is RIGHT. "
+                           "Positive pitch looks DOWN, negative pitch looks UP "
+                           "(verified on hardware). You must supply a non-zero "
+                           "value for the axis you are asked to move: to look "
+                           "up use pitch_deg -25, to look down use 25, to look "
+                           "left use yaw_deg 40, to look right use -40. Zero "
+                           "means centred, so never send 0 for the axis the "
+                           "user asked you to move.",
+            "parameters": {"type": "object", "properties": {
+                "yaw_deg": {"type": "number", "description": "-70 (right) to 70 (left)"},
+                "pitch_deg": {"type": "number", "description": "-35 (up) to 35 (down)"},
+                "roll_deg": {"type": "number", "description": "-35 to 35, head tilt"},
+            }, "required": ["yaw_deg"]}}},
+        {"type": "function", "function": {
+            "name": "turn_body",
+            "description": "Rotate the whole body. Positive is LEFT, negative "
+                           "is RIGHT. Use for large turns beyond head range.",
+            "parameters": {"type": "object", "properties": {
+                "yaw_deg": {"type": "number", "description": "-160 to 160"},
+            }, "required": ["yaw_deg"]}}},
+        {"type": "function", "function": {
+            "name": "play_emotion",
+            "description": "Play an expressive animation. Use when asked to "
+                           "show an emotion, dance, nod yes, or shake no.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string",
+                         "description": "e.g. happy, curious, sad, dance, yes, "
+                                        "no, surprised, proud, laughing"},
+            }, "required": ["name"]}}},
+        {"type": "function", "function": {
+            "name": "reset_pose",
+            "description": "Return the head, body and antennas to neutral.",
+            "parameters": {"type": "object", "properties": {}}}},
+    ]
+    if AGENT_ENABLED:
+        tools.append({"type": "function", "function": {
+            "name": "run_agent",
+            "description": "Delegate a computer task to an external coding "
+                           "agent: search the web, read or check files, run "
+                           "commands, look something up. Pass the request in "
+                           "plain English. Slow (seconds to minutes).",
+            "parameters": {"type": "object", "properties": {
+                "task": {"type": "string",
+                         "description": "the task, in plain English"},
+            }, "required": ["task"]}}})
+    return tools
 
 
 class Motion:
@@ -660,8 +1004,12 @@ class VoiceAgent:
         del self.history[:-12]
         self._set_state("thinking")
         t0 = time.time()
+
+        def on_tool(name, args, result):
+            self.emit("tool", name=name, args=args, result=str(result)[:120])
+
         try:
-            answer = self.brain.reply(self.history, self.world)
+            answer = self.brain.reply(self.history, self.world, on_tool=on_tool)
         except Exception as e:
             self.emit("error", where="llm", detail=f"{type(e).__name__}: {e}")
             self._set_state("idle")

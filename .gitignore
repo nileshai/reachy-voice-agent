@@ -30,3 +30,4 @@ sounds/
 # Personal operational notes — robot hardware_id, Wi-Fi SSID, warranty details
 REACHY_HANDOFF.md
 MIC_TEARDOWN_CHECKLIST.md
+.claude/
