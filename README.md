@@ -313,6 +313,13 @@ build.nvidia.com, or pick another model.
 
 ---
 
+## Continuing this work
+
+[`HANDOFF.md`](HANDOFF.md) records what was measured, which approaches were
+tried and rejected, the bugs that cost real time, and what is still open.
+Read it before changing the pipeline — several obvious-looking ideas in there
+have already been ruled out with numbers.
+
 ## Credits
 
 Built on [Pollen Robotics](https://www.pollen-robotics.com/) Reachy Mini and
