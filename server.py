@@ -30,6 +30,9 @@ from pydantic import BaseModel
 ROBOT_IP = os.environ.get("REACHY_IP", "192.168.1.2")
 ROBOT = f"http://{ROBOT_IP}:8000"
 
+# Restored on every power-on; the daemon does not persist it across restarts.
+SPEAKER_VOLUME = int(os.environ.get("REACHY_VOLUME", 100))
+
 app = FastAPI(title="Reachy Mini Control Center")
 
 client = httpx.AsyncClient(base_url=ROBOT, timeout=15.0)
@@ -742,6 +745,106 @@ async def diagnostics():
         results["wifi"] = {"pass": False, "detail": str(e)}
 
     return results
+
+
+# ------------------------------------------------------------ robot power
+# Start/stop the robot daemon from the UI. Both daemon endpoints require an
+# explicit query parameter (wake_up / goto_sleep) and return 422 without it.
+
+
+@app.get("/api/power/status")
+async def power_status():
+    out = {"reachable": False, "state": "unknown", "motors": None, "busy": False}
+    try:
+        d = await robot_get("/api/daemon/status")
+        out["reachable"] = True
+        out["state"] = d.get("state", "unknown")
+        out["motors"] = (d.get("backend_status") or {}).get("motor_control_mode")
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}"
+    return out
+
+
+async def _daemon_state() -> str:
+    try:
+        return (await robot_get("/api/daemon/status")).get("state", "unknown")
+    except Exception:
+        return "unreachable"
+
+
+async def _await_state(target: str, timeout: float = 40.0) -> str:
+    """Poll until the daemon reaches `target`. Returns the last state seen.
+
+    Both transitions report an intermediate state ("starting"/"stopping"), and
+    issuing the opposite command during one silently loses it — a start sent
+    mid-stop is discarded and the daemon settles at stopped.
+    """
+    deadline = time.time() + timeout
+    state = await _daemon_state()
+    while state != target and time.time() < deadline:
+        await asyncio.sleep(1.5)
+        state = await _daemon_state()
+    return state
+
+
+@app.post("/api/power/on")
+async def power_on():
+    """Start the daemon, then wake. Waking before the motors are enabled is a
+    no-op, so the order here is not interchangeable."""
+    if await _daemon_state() == "stopping":
+        await _await_state("stopped", 40)      # never start mid-stop
+    if await _daemon_state() != "running":
+        try:
+            await robot_post("/api/daemon/start?wake_up=true")
+        except Exception as e:
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, 502)
+        state = await _await_state("running", 45)
+        if state != "running":
+            return JSONResponse(
+                {"status": "error", "detail": f"daemon did not start (state {state})"},
+                504)
+
+    # The backend lags the daemon by a few seconds; retry rather than assume.
+    for attempt in range(10):
+        try:
+            await robot_post("/api/motors/set_mode/enabled")
+            break
+        except Exception:
+            await asyncio.sleep(1.5)
+    else:
+        return JSONResponse({"status": "error", "detail": "motors never enabled"}, 504)
+
+    # A daemon restart resets the speaker volume (observed dropping to 62),
+    # which reads as "the robot got quiet" long after the restart is forgotten.
+    try:
+        await robot_post("/api/volume/set", {"volume": int(SPEAKER_VOLUME)})
+    except Exception:
+        pass
+
+    await asyncio.sleep(0.5)
+    try:
+        await robot_post("/api/move/play/wake_up")
+    except Exception:
+        pass                                   # already awake is not an error
+    return {"status": "on"}
+
+
+@app.post("/api/power/off")
+async def power_off():
+    """Park in the sleep pose, then stop the daemon and wait for it to settle."""
+    try:
+        await robot_post("/api/move/play/goto_sleep")
+        await asyncio.sleep(5)                 # let the move finish
+    except Exception:
+        pass
+    try:
+        await robot_post("/api/daemon/stop?goto_sleep=true")
+    except Exception as e:
+        return JSONResponse({"status": "error", "detail": str(e)[:200]}, 502)
+    # Return only once it is really stopped, so an immediate power-on that
+    # follows is not swallowed by the in-progress transition.
+    state = await _await_state("stopped", 40)
+    return {"status": "off", "state": state}
 
 
 # -------------------------------------------------------------- voice agent
