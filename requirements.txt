@@ -1,0 +1,13 @@
+# Runtime dependencies. For an editable install use `pip install -e .` instead.
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27
+pydantic>=2.0
+numpy>=1.26
+websockets>=12.0
+python-multipart>=0.0.9
+nvidia-riva-client>=2.20
+
+# Optional but strongly recommended — on-device wake detection, so audio never
+# leaves the machine until the wake phrase is heard.
+faster-whisper>=1.0

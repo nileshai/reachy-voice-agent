@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>REACHY·MINI — Control Center</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/gstwebrtc-api@3.0.0/dist/gstwebrtc-api-3.0.0.min.js"></script>
+<style>
+:root{
+  --bg:#171310;
+  --bg2:#1f1a15;
+  --panel:#241e18;
+  --panel2:#2b241d;
+  --line:#3a3128;
+  --cream:#f2ead9;
+  --cream-dim:#b9ae99;
+  --faint:#7a7060;
+  --amber:#ffb454;
+  --amber-deep:#e08d2e;
+  --coral:#ff6b57;
+  --mint:#8fd8a8;
+  --sky:#7fc4e8;
+  --radius:14px;
+  font-size:15px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:
+    radial-gradient(1200px 600px at 75% -10%, rgba(255,180,84,.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(255,107,87,.05), transparent 60%),
+    var(--bg);
+  color:var(--cream);
+  font-family:'IBM Plex Mono', monospace;
+  min-height:100vh;
+  padding:22px 26px 40px;
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:99;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='.05'/%3E%3C/svg%3E");
+}
+h1,h2,.display{font-family:'Bricolage Grotesque', sans-serif}
+
+/* ---------- header ---------- */
+header{
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+  padding-bottom:16px;border-bottom:1px dashed var(--line);margin-bottom:20px;
+}
+.logo{display:flex;align-items:baseline;gap:10px}
+.logo h1{font-size:1.7rem;font-weight:750;letter-spacing:-.02em}
+.logo h1 em{font-style:normal;color:var(--amber)}
+.logo .sub{color:var(--faint);font-size:.72rem;text-transform:uppercase;letter-spacing:.18em}
+.leds{display:flex;gap:14px;margin-left:auto;align-items:center}
+.led{display:flex;align-items:center;gap:7px;font-size:.72rem;color:var(--cream-dim);text-transform:uppercase;letter-spacing:.1em}
+.led i{width:9px;height:9px;border-radius:50%;background:#4a4238;display:inline-block;transition:.3s}
+.led.on i{background:var(--mint);box-shadow:0 0 8px var(--mint)}
+.led.bad i{background:var(--coral);box-shadow:0 0 8px var(--coral)}
+.ip{font-size:.72rem;color:var(--faint);border:1px solid var(--line);padding:4px 10px;border-radius:20px}
+
+/* ---------- layout ---------- */
+.grid{display:grid;grid-template-columns:390px 1fr 360px;gap:18px;align-items:start}
+@media(max-width:1200px){.grid{grid-template-columns:1fr 1fr}}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.panel{
+  background:linear-gradient(180deg,var(--panel),var(--bg2));
+  border:1px solid var(--line);border-radius:var(--radius);
+  padding:18px;position:relative;overflow:hidden;
+}
+.panel h2{
+  font-size:.95rem;font-weight:700;letter-spacing:.02em;margin-bottom:14px;
+  display:flex;align-items:center;gap:8px;color:var(--cream);
+}
+.panel h2::before{content:"";width:8px;height:8px;background:var(--amber);border-radius:2px;transform:rotate(45deg)}
+.tag{font-size:.62rem;color:var(--faint);text-transform:uppercase;letter-spacing:.15em;margin-left:auto}
+
+/* ---------- head pad ---------- */
+.pad{
+  width:100%;aspect-ratio:1;border-radius:12px;position:relative;cursor:crosshair;
+  background:
+    repeating-linear-gradient(0deg,transparent 0 24px, rgba(242,234,217,.04) 24px 25px),
+    repeating-linear-gradient(90deg,transparent 0 24px, rgba(242,234,217,.04) 24px 25px),
+    radial-gradient(circle at 50% 50%, rgba(255,180,84,.06), transparent 65%),
+    var(--bg);
+  border:1px solid var(--line);
+  touch-action:none;
+}
+.pad .axis-x,.pad .axis-y{position:absolute;background:rgba(242,234,217,.12)}
+.pad .axis-x{left:0;right:0;top:50%;height:1px}
+.pad .axis-y{top:0;bottom:0;left:50%;width:1px}
+.pad .dot{
+  position:absolute;width:26px;height:26px;border-radius:50%;
+  background:radial-gradient(circle at 35% 30%, #ffd9a0, var(--amber) 60%, var(--amber-deep));
+  box-shadow:0 0 18px rgba(255,180,84,.5), 0 3px 8px rgba(0,0,0,.5);
+  transform:translate(-50%,-50%);left:50%;top:50%;transition:left .06s linear, top .06s linear;
+}
+.pad .ghost{
+  position:absolute;width:14px;height:14px;border-radius:50%;
+  border:1.5px solid var(--sky);opacity:.9;
+  transform:translate(-50%,-50%);left:50%;top:50%;transition:left .12s, top .12s;
+}
+.pad-labels{display:flex;justify-content:space-between;font-size:.62rem;color:var(--faint);margin-top:6px;text-transform:uppercase;letter-spacing:.12em}
+
+/* ---------- sliders ---------- */
+.sliders{margin-top:16px;display:flex;flex-direction:column;gap:12px}
+.srow{display:grid;grid-template-columns:86px 1fr 58px;gap:10px;align-items:center}
+.srow label{font-size:.7rem;color:var(--cream-dim);text-transform:uppercase;letter-spacing:.1em}
+.srow output{font-size:.72rem;color:var(--amber);text-align:right}
+input[type=range]{
+  -webkit-appearance:none;appearance:none;height:4px;border-radius:2px;width:100%;
+  background:linear-gradient(90deg,var(--amber) var(--fill,50%), #3a3128 var(--fill,50%));
+  outline:none;
+}
+input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:18px;height:18px;border-radius:50%;
+  background:radial-gradient(circle at 35% 30%, #fff3dd, var(--cream) 55%, #c9bda6);
+  border:2px solid var(--bg);box-shadow:0 2px 6px rgba(0,0,0,.6);cursor:grab;
+}
+.slider-actions{display:flex;gap:8px;margin-top:14px}
+
+/* ---------- buttons ---------- */
+button{
+  font-family:'IBM Plex Mono',monospace;font-size:.78rem;font-weight:600;
+  background:var(--panel2);color:var(--cream);border:1px solid var(--line);
+  border-radius:10px;padding:10px 14px;cursor:pointer;letter-spacing:.03em;
+  transition:transform .08s, background .15s, border-color .15s, box-shadow .15s;
+  position:relative;
+}
+button:hover{background:#352c22;border-color:#4d4234;transform:translateY(-1px)}
+button:active{transform:translateY(1px)}
+button.primary{
+  background:linear-gradient(180deg,var(--amber),var(--amber-deep));color:#241a0c;border-color:var(--amber-deep);
+  box-shadow:0 4px 14px rgba(255,180,84,.25), inset 0 1px 0 rgba(255,255,255,.35);
+}
+button.primary:hover{filter:brightness(1.07)}
+button.danger{color:var(--coral);border-color:#5c352e}
+button.danger:hover{background:#3a241f}
+button.ghost{background:transparent}
+button:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.btn-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.btn-grid .wide{grid-column:span 3}
+.emotes{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+.emotes button{padding:12px 6px;font-size:1.15rem;line-height:1}
+.emotes button span{display:block;font-size:.56rem;color:var(--cream-dim);margin-top:5px;text-transform:uppercase;letter-spacing:.08em}
+
+/* ---------- music ---------- */
+.dropzone{
+  border:1.5px dashed var(--line);border-radius:10px;padding:16px;text-align:center;
+  color:var(--faint);font-size:.72rem;cursor:pointer;transition:.2s;letter-spacing:.05em;
+}
+.dropzone:hover,.dropzone.drag{border-color:var(--amber);color:var(--amber);background:rgba(255,180,84,.04)}
+.tracks{margin-top:12px;display:flex;flex-direction:column;gap:6px;max-height:180px;overflow-y:auto}
+.track{
+  display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
+  background:var(--bg);border:1px solid var(--line);font-size:.74rem;
+}
+.track .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--cream-dim)}
+.track button{padding:5px 9px;font-size:.68rem;border-radius:6px}
+.track.playing{border-color:var(--amber);}
+.track.playing .name{color:var(--amber)}
+.eq{display:none;gap:2px;align-items:flex-end;height:14px}
+.track.playing .eq{display:flex}
+.eq i{width:3px;background:var(--amber);animation:eq .7s ease-in-out infinite alternate}
+.eq i:nth-child(2){animation-delay:.2s}.eq i:nth-child(3){animation-delay:.4s}
+@keyframes eq{from{height:3px}to{height:14px}}
+.music-row{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.checkbox{display:flex;align-items:center;gap:7px;font-size:.72rem;color:var(--cream-dim);cursor:pointer;user-select:none}
+.checkbox input{accent-color:var(--amber);width:15px;height:15px}
+
+/* ---------- chat ---------- */
+.chat{display:flex;flex-direction:column;height:520px}
+.chat-log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:4px 2px;margin-bottom:12px}
+.msg{max-width:88%;padding:9px 12px;border-radius:12px;font-size:.78rem;line-height:1.5;animation:pop .25s ease}
+.msg.user{align-self:flex-end;background:var(--panel2);border:1px solid var(--line);border-bottom-right-radius:4px}
+.msg.bot{align-self:flex-start;background:rgba(255,180,84,.1);border:1px solid rgba(255,180,84,.25);border-bottom-left-radius:4px;color:#ffe4bd}
+.msg.sys{align-self:center;color:var(--faint);font-size:.66rem;background:none;border:none}
+@keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.chat-input{display:flex;gap:8px}
+.chat-input input{
+  flex:1;background:var(--bg);border:1px solid var(--line);border-radius:10px;
+  color:var(--cream);font-family:inherit;font-size:.8rem;padding:11px 13px;outline:none;
+}
+.chat-input input:focus{border-color:var(--amber)}
+.typing{display:inline-flex;gap:4px;padding:4px 2px}
+.typing i{width:5px;height:5px;border-radius:50%;background:var(--amber);animation:blink 1s infinite}
+.typing i:nth-child(2){animation-delay:.2s}.typing i:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,100%{opacity:.2}50%{opacity:1}}
+
+/* ---------- telemetry & diagnostics ---------- */
+.telemetry{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:4px}
+.tcell{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.tcell .k{font-size:.58rem;color:var(--faint);text-transform:uppercase;letter-spacing:.12em}
+.tcell .v{font-size:.85rem;color:var(--amber);margin-top:3px}
+.diag-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.diag{
+  display:flex;gap:10px;align-items:baseline;padding:9px 12px;border-radius:8px;
+  background:var(--bg);border:1px solid var(--line);font-size:.72rem;
+}
+.diag .badge{font-size:.6rem;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:.08em}
+.diag.pass .badge{background:rgba(143,216,168,.15);color:var(--mint);border:1px solid rgba(143,216,168,.3)}
+.diag.fail .badge{background:rgba(255,107,87,.14);color:var(--coral);border:1px solid rgba(255,107,87,.3)}
+.diag .what{font-weight:600;text-transform:capitalize;min-width:86px}
+.diag .detail{color:var(--cream-dim);line-height:1.45}
+.volume-row{display:flex;align-items:center;gap:10px;margin-top:14px}
+.volume-row label{font-size:.68rem;color:var(--cream-dim);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}
+.spin{animation:spin 1s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+footer{margin-top:26px;color:var(--faint);font-size:.64rem;text-align:center;letter-spacing:.1em}
+::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <h1>REACHY<em>·</em>MINI</h1>
+    <span class="sub display">control center</span>
+  </div>
+  <div class="leds">
+    <span class="led" id="led-link"><i></i>link</span>
+    <span class="led" id="led-motors"><i></i>motors</span>
+    <span class="led" id="led-media"><i></i>media</span>
+    <span class="ip" id="ip">192.168.1.2</span>
+  </div>
+</header>
+
+<div class="grid">
+
+  <!-- ============ LEFT: MOTION ============ -->
+  <section class="panel">
+    <h2>Head Attitude <span class="tag">drag to aim</span></h2>
+    <div class="pad" id="pad">
+      <div class="axis-x"></div><div class="axis-y"></div>
+      <div class="ghost" id="ghost"></div>
+      <div class="dot" id="dot"></div>
+    </div>
+    <div class="pad-labels"><span>← yaw −</span><span>pitch ↕</span><span>+ yaw →</span></div>
+
+    <div class="sliders">
+      <div class="srow"><label>height z</label><input type="range" id="s-z" min="-20" max="25" value="0"><output id="o-z">0 mm</output></div>
+      <div class="srow"><label>roll</label><input type="range" id="s-roll" min="-30" max="30" value="0"><output id="o-roll">0°</output></div>
+      <div class="srow"><label>body yaw</label><input type="range" id="s-body" min="-150" max="150" value="0"><output id="o-body">0°</output></div>
+      <div class="srow"><label>antenna L</label><input type="range" id="s-al" min="-150" max="150" value="0"><output id="o-al">0°</output></div>
+      <div class="srow"><label>antenna R</label><input type="range" id="s-ar" min="-150" max="150" value="0"><output id="o-ar">0°</output></div>
+    </div>
+    <div class="slider-actions">
+      <button class="primary" id="btn-send" style="flex:1">SEND POSE</button>
+      <button id="btn-center">RE-CENTER</button>
+    </div>
+  </section>
+
+  <!-- ============ MIDDLE: ACTIONS + MUSIC ============ -->
+  <div style="display:flex;flex-direction:column;gap:18px">
+    <section class="panel">
+      <h2>Quick Actions</h2>
+      <div class="btn-grid">
+        <button class="primary" id="btn-wake">⏻ WAKE UP</button>
+        <button id="btn-sleep">☾ SLEEP</button>
+        <button id="btn-neutral">◎ NEUTRAL</button>
+        <button id="btn-dance" class="wide">✦ DANCE ✦</button>
+        <button class="danger wide" id="btn-stop">■ STOP ALL MOTION</button>
+      </div>
+      <div class="emotes">
+        <button data-emo="yes1">🙂<span>yes</span></button>
+        <button data-emo="no1">🙃<span>no</span></button>
+        <button data-emo="curious1">🤨<span>curious</span></button>
+        <button data-emo="enthusiastic1">🤩<span>excited</span></button>
+        <button data-emo="sad1">😔<span>sad</span></button>
+        <button data-emo="laughing1">😂<span>laugh</span></button>
+        <button data-emo="loving1">🥰<span>loving</span></button>
+        <button data-emo="rage1">😤<span>rage</span></button>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <select id="emo-select" style="flex:1;background:var(--bg);color:var(--cream);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-family:inherit;font-size:.76rem">
+          <option>loading emotion library…</option>
+        </select>
+        <button class="primary" id="emo-play">▶ PLAY</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Music Deck <span class="tag">plays on robot speaker</span></h2>
+      <div class="dropzone" id="dropzone">⇪ drop a song here or click to browse<br><small>mp3 · wav · ogg</small></div>
+      <input type="file" id="file-input" accept="audio/*" hidden>
+      <div class="tracks" id="tracks"></div>
+      <div class="music-row">
+        <label class="checkbox"><input type="checkbox" id="wobble" checked> head-wobble while playing</label>
+        <button class="danger" id="btn-sound-stop" style="margin-left:auto">■ stop sound</button>
+      </div>
+      <div class="volume-row">
+        <label>🔊 volume</label>
+        <input type="range" id="s-vol" min="0" max="100" value="80" style="flex:1">
+        <output id="o-vol">80</output>
+        <button id="btn-beep" title="play test beep">beep</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ============ RIGHT: EYES + CHAT ============ -->
+  <div style="display:flex;flex-direction:column;gap:18px">
+    <section class="panel">
+      <h2>Robot Eyes &amp; Ears <span class="tag" id="cam-status">connecting…</span></h2>
+      <div style="position:relative;border-radius:10px;overflow:hidden;border:1px solid var(--line);background:var(--bg)">
+        <img id="cam-img" alt="" style="width:100%;aspect-ratio:16/9;display:block;object-fit:cover;background:var(--bg)">
+        <video id="cam" autoplay playsinline muted style="display:none"></video>
+        <span id="cam-live" style="display:none;position:absolute;top:8px;left:8px;font-size:.6rem;font-weight:700;letter-spacing:.1em;background:rgba(255,107,87,.9);color:#fff;padding:2px 8px;border-radius:10px">● LIVE</span>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:10px">
+        <button id="btn-listen" title="hear what the robot's mics hear">🔇 listen</button>
+        <div style="flex:1">
+          <div style="font-size:.58rem;color:var(--faint);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">robot mic level — speak to the robot</div>
+          <div style="height:10px;border-radius:5px;background:var(--bg);border:1px solid var(--line);overflow:hidden">
+            <div id="vu" style="height:100%;width:0%;background:linear-gradient(90deg,var(--mint),var(--amber) 70%,var(--coral));transition:width .08s linear"></div>
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button id="btn-mictest" style="background:var(--amber);color:#1a1208;font-weight:700">🎙 record &amp; play back</button>
+          <select id="mic-secs" style="background:var(--bg);color:var(--cream);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit;font-size:.7rem">
+            <option value="3">3s</option>
+            <option value="5" selected>5s</option>
+            <option value="8">8s</option>
+          </select>
+          <button id="btn-micreplay" title="play the last recording again">↻ replay</button>
+        </div>
+        <div id="mic-result" style="margin-top:10px;font-size:.68rem;color:var(--faint);line-height:1.6">
+          beep → speak → Reachy plays it back. works without the video stream.
+        </div>
+      </div>
+    </section>
+    <section class="panel chat" style="height:auto">
+      <h2>Converse <span class="tag">spoken via robot</span></h2>
+      <div class="chat-log" id="chat-log" style="height:220px;flex:none">
+        <div class="msg sys">say hi — replies come out of Reachy's speaker</div>
+      </div>
+      <div class="chat-input">
+        <input id="chat-text" placeholder="talk to reachy…" autocomplete="off">
+        <button class="primary" id="chat-send">➤</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ============ BOTTOM: TELEMETRY + DIAGNOSTICS ============ -->
+  <section class="panel" style="grid-column:1/-1">
+    <h2>Telemetry &amp; Hardware Diagnostics
+      <span class="tag">live encoder readout @1 Hz</span>
+    </h2>
+    <div class="telemetry" id="telemetry"></div>
+    <div style="display:flex;gap:10px;margin-top:14px;align-items:center">
+      <button class="primary" id="btn-diag">▶ RUN FULL HARDWARE CHECK</button>
+      <span style="font-size:.68rem;color:var(--faint)">moves the head, plays a sound — takes ~6s</span>
+    </div>
+    <div class="diag-list" id="diag-list"></div>
+  </section>
+</div>
+
+<footer>REACHY MINI · WIRELESS · POLLEN ROBOTICS × HUGGING FACE · CONSOLE BUILT WITH CLAUDE</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = (path, opts={}) => fetch(path, {headers:{'Content-Type':'application/json'}, ...opts}).then(r=>r.json());
+const post = (path, body) => api(path, {method:'POST', body: body?JSON.stringify(body):undefined});
+
+/* ---------------- pose state ---------------- */
+const pose = {yaw:0, pitch:0, z:0, roll:0, body:0, al:0, ar:0};
+const D = Math.PI/180;
+let sendTimer = null;
+function scheduleSend(instant=false){
+  clearTimeout(sendTimer);
+  sendTimer = setTimeout(()=>{
+    post('/api/move', {
+      z:pose.z/1000, roll:pose.roll*D, pitch:pose.pitch*D, yaw:pose.yaw*D,
+      antennas:[pose.al*D, pose.ar*D], body_yaw:pose.body*D,
+      duration: instant? 0.35 : 0.7,
+    }).catch(()=>{});
+  }, instant? 30 : 120);
+}
+
+/* ---------------- head pad ---------------- */
+const pad = $('#pad'), dot = $('#dot'), ghost = $('#ghost');
+const YAW_MAX = 45, PITCH_MAX = 25;
+let dragging = false;
+function padSet(clientX, clientY){
+  const r = pad.getBoundingClientRect();
+  let nx = Math.min(1, Math.max(0,(clientX-r.left)/r.width));
+  let ny = Math.min(1, Math.max(0,(clientY-r.top)/r.height));
+  dot.style.left = nx*100+'%'; dot.style.top = ny*100+'%';
+  pose.yaw   = (nx-0.5)*2*YAW_MAX;
+  pose.pitch = (ny-0.5)*2*PITCH_MAX;
+  scheduleSend(true);
+}
+pad.addEventListener('pointerdown', e=>{dragging=true; pad.setPointerCapture(e.pointerId); padSet(e.clientX,e.clientY)});
+pad.addEventListener('pointermove', e=>{ if(dragging) padSet(e.clientX,e.clientY)});
+pad.addEventListener('pointerup', ()=>dragging=false);
+
+/* ---------------- sliders ---------------- */
+function bindSlider(id, out, key, unit){
+  const el = $(id), o = $(out);
+  const upd = ()=>{ const v=+el.value; o.textContent = v+unit;
+    const pct=(v-el.min)/(el.max-el.min)*100; el.style.setProperty('--fill',pct+'%');
+    pose[key]=v; scheduleSend(); };
+  el.addEventListener('input', upd); upd();
+}
+bindSlider('#s-z','#o-z','z',' mm');
+bindSlider('#s-roll','#o-roll','roll','°');
+bindSlider('#s-body','#o-body','body','°');
+bindSlider('#s-al','#o-al','al','°');
+bindSlider('#s-ar','#o-ar','ar','°');
+
+$('#btn-send').onclick = ()=>scheduleSend(true);
+$('#btn-center').onclick = ()=>{
+  Object.assign(pose,{yaw:0,pitch:0,z:0,roll:0,body:0,al:0,ar:0});
+  dot.style.left='50%'; dot.style.top='50%';
+  ['#s-z','#s-roll','#s-body','#s-al','#s-ar'].forEach(s=>{$(s).value=0;$(s).dispatchEvent(new Event('input'))});
+  post('/api/neutral');
+};
+
+/* ---------------- quick actions ---------------- */
+$('#btn-wake').onclick    = ()=>post('/api/wake');
+$('#btn-sleep').onclick   = ()=>post('/api/sleep');
+$('#btn-neutral').onclick = ()=>post('/api/neutral');
+$('#btn-stop').onclick    = ()=>{post('/api/dance/stop'); post('/api/move/stop');};
+const DANCES = ['dance1','dance2','dance3'];
+$('#btn-dance').onclick = ()=>post('/api/emotions/play/'+DANCES[Math.floor(Math.random()*DANCES.length)]);
+
+/* emotions: official pollen-robotics recorded-move library, played on-robot */
+document.querySelectorAll('[data-emo]').forEach(b=>{
+  b.onclick = ()=>post('/api/emotions/play/'+b.dataset.emo);
+});
+api('/api/emotions').then(list=>{
+  const sel = $('#emo-select');
+  sel.innerHTML = list.sort().map(e=>`<option value="${e}">${e}</option>`).join('');
+}).catch(()=>{});
+$('#emo-play').onclick = ()=>post('/api/emotions/play/'+$('#emo-select').value);
+
+/* ---------------- music ---------------- */
+const dz = $('#dropzone'), fi = $('#file-input');
+dz.onclick = ()=>fi.click();
+dz.ondragover = e=>{e.preventDefault(); dz.classList.add('drag')};
+dz.ondragleave = ()=>dz.classList.remove('drag');
+dz.ondrop = e=>{e.preventDefault(); dz.classList.remove('drag'); if(e.dataTransfer.files[0]) uploadSong(e.dataTransfer.files[0])};
+fi.onchange = ()=>fi.files[0] && uploadSong(fi.files[0]);
+
+let currentTrack = null;
+async function uploadSong(file){
+  dz.innerHTML = `<span class="spin">◌</span> uploading ${file.name}…`;
+  const fd = new FormData(); fd.append('file', file);
+  try{
+    await fetch('/api/sounds/upload', {method:'POST', body:fd});
+    dz.innerHTML = '⇪ drop a song here or click to browse<br><small>mp3 · wav · ogg</small>';
+    refreshTracks();
+  }catch(e){ dz.textContent = 'upload failed: '+e; }
+}
+async function refreshTracks(){
+  const d = await api('/api/sounds').catch(()=>({files:[]}));
+  const t = $('#tracks'); t.innerHTML='';
+  (d.files||[]).forEach(f=>{
+    const name = typeof f==='string' ? f : f.name;
+    const row = document.createElement('div'); row.className='track'+(currentTrack===name?' playing':'');
+    row.innerHTML = `<span class="eq"><i></i><i></i><i></i></span><span class="name">${name}</span>`;
+    const play = document.createElement('button'); play.textContent='▶';
+    play.onclick = async ()=>{ currentTrack=name;
+      await post('/api/sounds/play', {file:name, wobble: $('#wobble').checked}); refreshTracks(); };
+    const del = document.createElement('button'); del.textContent='✕'; del.className='ghost';
+    del.onclick = async ()=>{ await fetch('/api/sounds/'+encodeURIComponent(name),{method:'DELETE'}); refreshTracks(); };
+    row.append(play, del); t.append(row);
+  });
+  if(!(d.files||[]).length) t.innerHTML = '<div class="msg sys" style="align-self:center">no tracks uploaded yet</div>';
+}
+$('#btn-sound-stop').onclick = ()=>{currentTrack=null; post('/api/sounds/stop'); refreshTracks();};
+$('#btn-beep').onclick = ()=>post('/api/test-sound');
+const vol = $('#s-vol');
+vol.oninput = ()=>{ $('#o-vol').textContent=vol.value;
+  vol.style.setProperty('--fill', vol.value+'%'); };
+vol.onchange = ()=>post('/api/volume', {volume:+vol.value});
+
+/* ---------------- chat ---------------- */
+const log = $('#chat-log');
+function addMsg(cls, text){
+  const m = document.createElement('div'); m.className='msg '+cls; m.textContent=text;
+  log.append(m); log.scrollTop = log.scrollHeight; return m;
+}
+async function sendChat(){
+  const inp = $('#chat-text'); const text = inp.value.trim(); if(!text) return;
+  inp.value=''; addMsg('user', text);
+  const tip = addMsg('bot',''); tip.innerHTML='<span class="typing"><i></i><i></i><i></i></span>';
+  try{
+    const r = await post('/api/chat', {message:text});
+    tip.textContent = r.reply + (r.spoken ? '' : '  🔇');
+  }catch(e){ tip.textContent = 'connection error: '+e; }
+}
+$('#chat-send').onclick = sendChat;
+$('#chat-text').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChat(); });
+
+/* ---------------- telemetry poll ---------------- */
+const T = $('#telemetry');
+function tcell(k,v){ return `<div class="tcell"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
+async function poll(){
+  try{
+    const s = await api('/api/status');
+    $('#led-link').className = 'led '+(s.reachable?'on':'bad');
+    $('#led-motors').className = 'led '+(s.state?.control_mode==='enabled'?'on':'bad');
+    $('#led-media').className = 'led '+(s.media?.available?'on':'bad');
+    if(s.state){
+      const p = s.state.head_pose, r=x=>(x*180/Math.PI).toFixed(1), mm=x=>(x*1000).toFixed(1);
+      T.innerHTML =
+        tcell('head yaw', r(p.yaw)+'°') + tcell('head pitch', r(p.pitch)+'°') + tcell('head roll', r(p.roll)+'°') +
+        tcell('height z', mm(p.z)+' mm') + tcell('body yaw', r(s.state.body_yaw)+'°') +
+        tcell('antennas', r(s.state.antennas_position[0])+'° / '+r(s.state.antennas_position[1])+'°');
+      // ghost = where the head actually is, on the pad
+      ghost.style.left = (50 + (p.yaw*180/Math.PI)/YAW_MAX*50)+'%';
+      ghost.style.top  = (50 + (p.pitch*180/Math.PI)/PITCH_MAX*50)+'%';
+    }
+    if(typeof s.volume==='number' && document.activeElement!==vol){
+      vol.value=s.volume; $('#o-vol').textContent=s.volume; vol.style.setProperty('--fill',s.volume+'%');
+    }
+  }catch(e){ $('#led-link').className='led bad'; }
+}
+setInterval(poll, 1000); poll();
+
+/* ---------------- diagnostics ---------------- */
+$('#btn-diag').onclick = async ()=>{
+  const b=$('#btn-diag'); b.disabled=true; b.innerHTML='<span class="spin">◌</span> RUNNING…';
+  const list=$('#diag-list'); list.innerHTML='';
+  try{
+    const r = await post('/api/diagnostics');
+    for(const [k,v] of Object.entries(r)){
+      const d=document.createElement('div'); d.className='diag '+(v.pass?'pass':'fail');
+      d.innerHTML=`<span class="badge">${v.pass?'PASS':'FAIL'}</span><span class="what">${k}</span><span class="detail">${v.detail}</span>`;
+      list.append(d);
+    }
+  }catch(e){ list.innerHTML='<div class="diag fail"><span class="badge">ERR</span><span class="detail">'+e+'</span></div>'; }
+  b.disabled=false; b.textContent='▶ RUN FULL HARDWARE CHECK';
+};
+
+refreshTracks();
+
+/* ---------------- camera + robot-mic over WebRTC ---------------- */
+const ROBOT_WS = (location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws/signalling';
+const cam = $('#cam'), camStatus = $('#cam-status'), vu = $('#vu');
+let vuCtx = null;
+
+function attachVU(stream){
+  if(!stream.getAudioTracks().length) return;
+  const ac = new (window.AudioContext||window.webkitAudioContext)();
+  const src = ac.createMediaStreamSource(stream);
+  const an = ac.createAnalyser(); an.fftSize = 512;
+  src.connect(an);
+  const buf = new Uint8Array(an.frequencyBinCount);
+  (function tick(){
+    an.getByteTimeDomainData(buf);
+    let peak = 0;
+    for(const v of buf) peak = Math.max(peak, Math.abs(v-128));
+    vu.style.width = Math.min(100, (peak/128)*260) + '%';
+    requestAnimationFrame(tick);
+  })();
+  vuCtx = ac;
+}
+
+function camNote(msg){
+  let n = $('#cam-note');
+  if(!n){
+    n = document.createElement('div');
+    n.id = 'cam-note';
+    n.style.cssText = 'margin-top:8px;padding:8px 10px;border-radius:8px;'
+      + 'background:rgba(255,107,87,.09);border:1px solid rgba(255,107,87,.35);'
+      + 'font-size:.64rem;line-height:1.6;color:var(--cream)';
+    cam.parentElement.insertAdjacentElement('afterend', n);
+  }
+  n.innerHTML = msg;
+  n.style.display = msg ? 'block' : 'none';
+}
+
+// Video arrives as MJPEG from our own server (see /api/camera/stream). The
+// browser's WebRTC path can't complete ICE against the robot — Chrome hides the
+// local IP behind a random <uuid>.local candidate that the robot can't resolve,
+// so tracks go live but no frames ever arrive. Native GStreamer server-side has
+// no such problem.
+function startCamera(){
+  const img = $('#cam-img');
+  let tries = 0;
+
+  function load(){
+    camStatus.textContent = tries ? 'reconnecting…' : 'connecting…';
+    img.src = '/api/camera/stream?t=' + Date.now();
+  }
+  img.onload = ()=>{
+    tries = 0;
+    camStatus.textContent = 'streaming';
+    $('#cam-live').style.display = 'inline';
+    camNote('');
+  };
+  img.onerror = ()=>{
+    $('#cam-live').style.display = 'none';
+    if(++tries > 4){
+      camStatus.textContent = 'no video';
+      camNote('Couldn\'t start the camera stream. Check the robot is awake and '
+        + 'that <code>gst-launch-1.0</code> is installed '
+        + '(<code>brew install gstreamer libnice-gstreamer</code>).');
+      return;
+    }
+    camStatus.textContent = 'retry ' + tries;
+    setTimeout(load, 2500);
+  };
+  load();
+}
+
+function startCameraWebRTC(){
+  if(!window.GstWebRTCAPI){ camStatus.textContent = 'webrtc lib failed to load'; return; }
+  const gapi = new GstWebRTCAPI({signalingServerUrl: ROBOT_WS});
+
+  // Exactly one consumer session may be in flight. Overlapping sessions make
+  // the robot tear down the older peer, so every attempt has to close the
+  // previous one before opening the next.
+  let session = null, busy = false, attempts = 0, frameTimer = null;
+
+  function teardown(){
+    clearTimeout(frameTimer);
+    if(session){ try{ session.close(); }catch(e){} session = null; }
+    cam.srcObject = null;
+    $('#cam-live').style.display = 'none';
+  }
+
+  function fail(why){
+    if(!busy) return;              // already handled this attempt
+    busy = false;
+    teardown();
+    if(++attempts > 4){
+      camStatus.textContent = 'no video';
+      camNote('The camera works on the robot but the browser can\'t get a media '
+        + 'path to it. Check that nothing (VPN, firewall, or another open tab '
+        + 'consuming the stream) is in the way, then reload.');
+      return;
+    }
+    camStatus.textContent = why + ' — retry ' + attempts;
+    setTimeout(open, 2500);        // let the robot fully drop the old peer
+  }
+
+  function open(){
+    if(busy) return;
+    const producers = gapi.getAvailableProducers();
+    if(!producers.length){ camStatus.textContent = 'waiting for camera…'; setTimeout(open, 1000); return; }
+    busy = true;
+    camNote('');
+    teardown();
+    camStatus.textContent = 'connecting…';
+
+    session = gapi.createConsumerSession(producers[0].id);
+    let framed = false;
+
+    session.addEventListener('error',  ()=>{ if(!framed) fail('stream error'); });
+    session.addEventListener('closed', ()=>{ if(!framed) fail('stream closed'); });
+    session.addEventListener('streamsChanged', ()=>{
+      if(!session || !session.streams.length) return;
+      const stream = session.streams[0];
+      cam.srcObject = stream;
+      camStatus.textContent = 'negotiating…';
+
+      // streamsChanged fires when the transceivers appear — well before ICE
+      // connects. Wait for a decoded frame before calling it live.
+      const onFrame = ()=>{
+        if(framed) return;
+        if(cam.videoWidth > 2){
+          framed = true; busy = false; attempts = 0;
+          clearTimeout(frameTimer);
+          camStatus.textContent = 'streaming';
+          $('#cam-live').style.display = 'inline';
+          camNote('');
+          attachVU(stream);
+        } else if(cam.requestVideoFrameCallback){
+          cam.requestVideoFrameCallback(onFrame);
+        }
+      };
+      if(cam.requestVideoFrameCallback) cam.requestVideoFrameCallback(onFrame);
+      else { const p = setInterval(()=>{ framed ? clearInterval(p) : onFrame(); }, 250); }
+    });
+
+    frameTimer = setTimeout(()=>{ if(!framed) fail('no frames'); }, 20000);
+    session.connect();
+  }
+
+  gapi.registerConnectionListener({
+    connected(){ camStatus.textContent = 'signalling connected'; attempts = 0; open(); },
+    disconnected(){ camStatus.textContent = 'signalling lost'; busy = false; teardown(); }
+  });
+}
+startCamera();
+
+$('#btn-listen').onclick = function(){
+  cam.muted = !cam.muted;
+  if(vuCtx && vuCtx.state==='suspended') vuCtx.resume();
+  this.textContent = cam.muted ? '🔇 listen' : '🔊 listening';
+};
+
+// ---- mic record / playback test (runs entirely on the robot) ----
+const micBtn = $('#btn-mictest'), micOut = $('#mic-result'), micReplay = $('#btn-micreplay');
+
+function micSay(html, colour){ micOut.innerHTML = html; micOut.style.color = colour || 'var(--faint)'; }
+
+micBtn.onclick = async function(){
+  const secs = +$('#mic-secs').value;
+  micBtn.disabled = micReplay.disabled = true;
+  const label = micBtn.textContent;
+  micBtn.textContent = '● recording…';
+  micSay('🔔 listen for the beep, then speak…', 'var(--amber)');
+
+  // rough countdown while the robot beeps + records
+  let left = secs;
+  const tick = setInterval(()=>{
+    if(--left > 0) micSay(`● recording — ${left}s left… keep talking`, 'var(--coral)');
+  }, 1000);
+
+  try{
+    const r = await fetch('/api/mic/test', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({seconds: secs, playback: true})
+    }).then(x=>x.json());
+    clearInterval(tick);
+
+    if(!r.ok){ micSay('✕ ' + (r.error || 'test failed'), 'var(--coral)'); return; }
+    const bar = Math.min(100, Math.round((r.peak/8000)*100));
+    micSay(
+      `<b style="color:${r.heard?'var(--mint)':'var(--coral)'}">${r.heard?'✓':'✕'} ${r.verdict}</b><br>` +
+      `<div style="height:8px;border-radius:4px;background:var(--bg);border:1px solid var(--line);overflow:hidden;margin:6px 0">` +
+      `<div style="height:100%;width:${bar}%;background:linear-gradient(90deg,var(--mint),var(--amber))"></div></div>` +
+      `peak <b>${r.peak}</b> · rms <b>${r.rms}</b> · ${r.nonzero_pct}% non-silent · ${r.samples} samples` +
+      (r.played_back ? '<br>🔊 played back through Reachy\'s speaker' :
+        (r.heard ? '<br>⚠ recorded but playback failed' : '')),
+      'var(--faint)');
+  }catch(e){
+    clearInterval(tick);
+    micSay('✕ ' + e.message, 'var(--coral)');
+  }finally{
+    micBtn.disabled = micReplay.disabled = false;
+    micBtn.textContent = label;
+  }
+};
+
+micReplay.onclick = async function(){
+  this.disabled = true;
+  try{
+    const r = await fetch('/api/mic/replay', {method:'POST'}).then(x=>x.json());
+    if(!r.ok) micSay('✕ ' + (r.error || 'nothing recorded yet'), 'var(--coral)');
+  }finally{ this.disabled = false; }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reachy — Voice Assistant</title>
+<style>
+  :root {
+    --bg: #0b0e0c;
+    --panel: #121714;
+    --panel-2: #171d1a;
+    --line: #232b27;
+    --text: #e8efea;
+    --dim: #8b9990;
+    --accent: #76b900;          /* NVIDIA green */
+    --accent-dim: #4a7500;
+    --warn: #e0a030;
+    --err: #e05252;
+    --user: #3aa0ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  h1 {
+    font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .3px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  h1 .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--dim);
+    transition: background .3s, box-shadow .3s;
+  }
+  h1 .dot.on { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+
+  .state {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
+    padding: 5px 12px; border-radius: 100px; font-weight: 600;
+    background: #1c2320; color: var(--dim); border: 1px solid var(--line);
+    transition: all .25s;
+  }
+  .state[data-s="listening"] { background: #10321a; color: #7ee08a; border-color: #1d5c2c; }
+  .state[data-s="thinking"]  { background: #33280d; color: #f0c565; border-color: #5c4715; }
+  .state[data-s="speaking"]  { background: #0f2a38; color: #6cc8f0; border-color: #17475e; }
+
+  .spacer { flex: 1; }
+
+  button {
+    font: inherit; font-weight: 600; cursor: pointer; border-radius: 7px;
+    padding: 9px 20px; border: 1px solid transparent; transition: all .15s;
+  }
+  #toggle { background: var(--accent); color: #0b0e0c; }
+  #toggle:hover:not(:disabled) { background: #86d000; }
+  #toggle.running { background: transparent; color: var(--err); border-color: #52302f; }
+  #toggle.running:hover { background: #2a1817; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .ghost {
+    background: transparent; color: var(--dim); border-color: var(--line);
+  }
+  .ghost:hover { color: var(--text); border-color: #37423c; }
+  .talk { background: #1c3350; color: #9ccdf5; border-color: #27496f; }
+  .talk:hover:not(:disabled) { background: #244066; }
+  .talk.armed {
+    background: var(--user); color: #04121f; border-color: var(--user);
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 6px rgba(58,160,255,.16); } }
+
+  main {
+    flex: 1; display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(340px, .85fr);
+    gap: 1px; background: var(--line); min-height: 0;
+  }
+  section { background: var(--bg); display: flex; flex-direction: column; min-height: 0; }
+  .head {
+    padding: 11px 16px; font-size: 11px; letter-spacing: 1.1px;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
+    border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px;
+  }
+
+  /* ---- video ---- */
+  .video-wrap {
+    position: relative; background: #000; flex: 1; min-height: 240px;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  #cam { width: 100%; height: 100%; object-fit: contain; display: none; }
+  .placeholder { color: #4a554e; font-size: 13px; text-align: center; padding: 30px; }
+  .caption {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 22px 18px 14px; font-size: 13px; line-height: 1.45;
+    background: linear-gradient(transparent, rgba(0,0,0,.88));
+    color: #d6e2d9;
+  }
+  .caption b { color: var(--accent); font-weight: 600; font-size: 10px;
+               letter-spacing: 1.1px; display: block; margin-bottom: 3px; }
+
+  /* ---- audio meter ---- */
+  .audio { padding: 14px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+  .meter {
+    position: relative; height: 26px; background: #0a0d0b; border-radius: 5px;
+    overflow: hidden; border: 1px solid var(--line);
+  }
+  #bar {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+    background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+    transition: width .09s linear;
+  }
+  #bar.over { background: linear-gradient(90deg, #2d7a2d, #7ee08a); }
+  #gate {
+    position: absolute; top: -2px; bottom: -2px; width: 2px;
+    background: var(--warn); box-shadow: 0 0 6px var(--warn); transition: left .3s;
+  }
+  .audio-legend {
+    display: flex; justify-content: space-between; margin-top: 7px;
+    font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums;
+  }
+
+  /* ---- transcript ---- */
+  #log { flex: 1; overflow-y: auto; padding: 14px 16px; min-height: 0; }
+  .msg { margin-bottom: 14px; animation: in .25s ease; }
+  @keyframes in { from { opacity: 0; transform: translateY(6px); } }
+  .who {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1.1px;
+    font-weight: 700; margin-bottom: 4px;
+  }
+  .msg.user  .who { color: var(--user); }
+  .msg.bot   .who { color: var(--accent); }
+  .msg .body {
+    padding: 9px 12px; border-radius: 8px; background: var(--panel-2);
+    border-left: 2px solid var(--line);
+  }
+  .msg.user .body { border-left-color: var(--user); }
+  .msg.bot  .body { border-left-color: var(--accent); }
+  .msg.skip .who  { color: var(--warn); }
+  .msg.skip .body {
+    border-left-color: #4a3f22; color: #7f8b83; text-decoration: line-through;
+    text-decoration-color: #4a4034; background: #14170f;
+  }
+  .meta { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .meta kbd {
+    background: #1f2a1a; border: 1px solid #34452a; border-radius: 3px;
+    padding: 1px 5px; color: var(--accent); font-family: inherit; font-size: 11px;
+  }
+
+  .sys {
+    font-size: 11.5px; color: var(--dim); padding: 5px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    border-bottom: 1px dashed #1b211e;
+  }
+  .sys.ignored { color: #5d6b63; }
+  .sys.err { color: var(--err); }
+  .sys.wake { color: var(--accent); font-weight: 600; }
+
+  .empty-state {
+    color: #4a554e; text-align: center; padding: 44px 24px; font-size: 13px;
+  }
+  .empty-state kbd {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+    padding: 2px 7px; font-family: inherit; font-size: 12px; color: var(--text);
+  }
+
+  footer {
+    padding: 9px 20px; border-top: 1px solid var(--line); background: var(--panel);
+    font-size: 11.5px; color: var(--dim); display: flex; gap: 20px; flex-wrap: wrap;
+    font-variant-numeric: tabular-nums;
+  }
+  footer b { color: #b9c7bf; font-weight: 600; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span class="dot" id="dot"></span> Reachy Voice Assistant</h1>
+  <span class="state" id="state" data-s="off">off</span>
+  <div class="spacer"></div>
+  <button class="ghost" id="clear">Clear</button>
+  <button class="talk" id="talk" disabled>Talk to Reachy</button>
+  <button id="toggle">Start conversation</button>
+</header>
+
+<main>
+  <section>
+    <div class="head">Camera <span id="vstat" style="color:#4a554e">—</span></div>
+    <div class="video-wrap">
+      <img id="cam" alt="">
+      <div class="placeholder" id="ph">Start the conversation to open the camera</div>
+      <div class="caption" id="cap" style="display:none"><b>Seeing</b><span id="capt"></span></div>
+    </div>
+    <div class="audio">
+      <div class="meter">
+        <div id="bar"></div>
+        <div id="gate" style="left:0%"></div>
+      </div>
+      <div class="audio-legend">
+        <span>level <b id="lvl">0</b></span>
+        <span style="color:var(--warn)">▏gate <span id="gt">0</span></span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="head">Transcript</div>
+    <div id="log">
+      <div class="empty-state" id="es">
+        Press <kbd>Start conversation</kbd>, then say <kbd id="es-wake">hey</kbd>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>llm <b id="f-llm">—</b></span>
+  <span>vision <b id="f-vlm">—</b></span>
+  <span>voice <b id="f-tts">—</b></span>
+  <span>wake <b id="f-wake">—</b></span>
+  <span>turns <b id="f-turns">0</b></span>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let running = false, since = 0, busy = false, wakePhrase = 'hey';
+
+// The meter is logarithmic: speech runs ~30x the noise floor, so a linear
+// scale would pin the bar at either end and show nothing useful.
+const toPct = v => Math.max(0, Math.min(100, (Math.log10(Math.max(v, 1)) / Math.log10(20000)) * 100));
+
+async function api(path, opts) {
+  const r = await fetch('/api/voice' + path, opts);
+  if (!r.ok) throw new Error(path + ' -> ' + r.status);
+  return r.json();
+}
+
+function attachStream() {
+  $('cam').src = '/api/voice/stream?t=' + Date.now();
+  $('cam').style.display = 'block';
+  $('ph').style.display = 'none';
+}
+function detachStream() {
+  $('cam').removeAttribute('src');
+  $('cam').style.display = 'none';
+  $('ph').style.display = 'block';
+  $('cap').style.display = 'none';
+}
+
+$('toggle').onclick = async () => {
+  if (busy) return;
+  busy = true; $('toggle').disabled = true;
+  try {
+    if (!running) {
+      await api('/start', { method: 'POST' });
+      $('es')?.remove();
+      sys('starting agent…');
+      // Give the pipeline a moment before attaching the stream, otherwise the
+      // <img> requests frames that do not exist yet and shows a broken icon.
+      setTimeout(attachStream, 2500);
+    } else {
+      await api('/stop', { method: 'POST' });
+      detachStream();
+      sys('stopped');
+    }
+  } catch (e) { sys('error: ' + e.message, 'err'); }
+  busy = false; $('toggle').disabled = false;
+};
+
+$('clear').onclick = () => { $('log').innerHTML = ''; };
+
+$('talk').onclick = async () => {
+  try {
+    const r = await api('/wake', { method: 'POST' });
+    sys('listening — ask your question now (' + r.seconds + 's)', 'wake');
+  } catch (e) { sys('could not wake: ' + e.message, 'err'); }
+};
+
+function atBottom() {
+  const l = $('log');
+  return l.scrollHeight - l.scrollTop - l.clientHeight < 60;
+}
+function append(node) {
+  const stick = atBottom();
+  $('log').appendChild(node);
+  if (stick) $('log').scrollTop = $('log').scrollHeight;
+}
+function sys(text, cls = '') {
+  const d = document.createElement('div');
+  d.className = 'sys ' + cls; d.textContent = text;
+  append(d);
+}
+// Heard clearly but not addressed to the robot. Shown as a struck-through
+// near-miss with the reason attached -- the previous build rendered these as
+// normal turns, which made a deliberate skip look like the agent had hung.
+function unaddressed(text) {
+  const d = document.createElement('div');
+  d.className = 'msg skip';
+  const w = document.createElement('div');
+  w.className = 'who'; w.textContent = 'Not addressed to Reachy';
+  const b = document.createElement('div'); b.className = 'body'; b.textContent = text;
+  const m = document.createElement('div'); m.className = 'meta';
+  m.innerHTML = 'no wake word — start with <kbd>' + wakePhrase +
+                '</kbd>, or click <kbd>Talk to Reachy</kbd>';
+  d.append(w, b, m);
+  append(d);
+}
+function msg(who, text, meta) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + (who === 'You' ? 'user' : 'bot');
+  const w = document.createElement('div'); w.className = 'who'; w.textContent = who;
+  const b = document.createElement('div'); b.className = 'body'; b.textContent = text;
+  d.append(w, b);
+  if (meta) {
+    const m = document.createElement('div'); m.className = 'meta'; m.textContent = meta;
+    d.appendChild(m);
+  }
+  append(d);
+}
+
+async function pollStatus() {
+  try {
+    const s = await api('/status');
+    running = !!s.running;
+    $('dot').classList.toggle('on', running);
+    $('state').textContent = running ? (s.state || 'idle') : 'off';
+    $('state').dataset.s = running ? (s.state || 'idle') : 'off';
+    $('toggle').textContent = running ? 'Stop' : 'Start conversation';
+    $('toggle').classList.toggle('running', running);
+    $('vstat').textContent = running ? 'live' : '—';
+    // Reattach on reload: the agent may already be running from a previous
+    // page load, in which case the click handler never fired.
+    if (running && !$('cam').src) attachStream();
+    if (!running && $('cam').src) detachStream();
+    $('talk').disabled = !running;
+    // `awake` means the wake phrase is not needed for the next utterance.
+    $('talk').classList.toggle('armed', running && !!s.awake);
+    $('talk').textContent = (running && s.awake) ? 'Listening — ask now'
+                                                 : 'Talk to Reachy';
+
+    if (running) {
+      $('bar').style.width = toPct(s.level) + '%';
+      $('gate').style.left = toPct(s.gate) + '%';
+      $('bar').classList.toggle('over', s.level >= s.gate);
+      $('lvl').textContent = s.level;
+      $('gt').textContent = s.gate;
+      if (s.world) { $('cap').style.display = 'block'; $('capt').textContent = s.world; }
+    }
+    $('f-llm').textContent = s.llm || '—';
+    $('f-vlm').textContent = s.vlm || '—';
+    $('f-tts').textContent = s.tts || '—';
+    $('f-turns').textContent = s.turns ?? 0;
+    if (s.wake_phrase) {
+      wakePhrase = s.wake_phrase;
+      const es = $('es-wake'); if (es) es.textContent = wakePhrase;
+    }
+    $('f-wake').textContent = s.no_wake ? 'OFF — replies to everything'
+      : `"${wakePhrase}" · ` +
+        (s.local_wake ? 'local (audio stays on device)' : 'cloud');
+  } catch (e) { /* server down between polls; next tick retries */ }
+}
+
+async function pollEvents() {
+  try {
+    const r = await api('/events?since=' + since);
+    since = r.now;
+    for (const e of r.events) {
+      if (e.kind === 'heard')        msg('You', e.text, e.secs + 's');
+      else if (e.kind === 'reply')   msg('Reachy', e.text, 'llm ' + e.llm_s + 's');
+      else if (e.kind === 'wake')    sys('wake detected locally: "' + e.local + '" (' + e.took + 's)', 'wake');
+      else if (e.kind === 'unaddressed') unaddressed(e.text);
+      else if (e.kind === 'ignored') sys('ignored, no wake word: "' + e.local + '"', 'ignored');
+      else if (e.kind === 'empty')   sys('background noise, no speech (' + e.secs + 's)', 'ignored');
+      else if (e.kind === 'error')   sys('error in ' + e.where + ': ' + e.detail, 'err');
+      else if (e.kind === 'ready')   sys('ready — wake: ' + e.wake);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+setInterval(pollStatus, 450);
+setInterval(pollEvents, 700);
+pollStatus();
+</script>
+</body>
+</html>

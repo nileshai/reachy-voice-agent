@@ -1,0 +1,32 @@
+# Secrets — never commit these
+.env
+.env.local
+*.key
+*_secret*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Runtime artefacts
+*.log
+uploads/
+sounds/
+*.wav
+*.raw
+*.jpg
+!static/**/*.jpg
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Personal operational notes — robot hardware_id, Wi-Fi SSID, warranty details
+REACHY_HANDOFF.md
+MIC_TEARDOWN_CHECKLIST.md
