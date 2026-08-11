@@ -84,19 +84,40 @@ ASR_FUNCTION = FN_ASR_PARAKEET
 
 EMOTIONS_DATASET = "pollen-robotics/reachy-mini-emotions-library"
 
-# Peak-normalise TTS to just under clipping. Gain is capped so a near-silent
-# synthesis result cannot be amplified into a wall of noise.
+# TTS loudness. TTS_TARGET_RMS is the average level aimed for as a fraction of
+# full scale; 0.16 is about -16 dBFS, loud for speech without sounding crushed.
+# Raise towards 0.22 for a noisy room, lower to 0.10 if it sounds harsh. Gain
+# is capped so a near-silent synthesis cannot be amplified into a wall of noise.
+# 22.05 kHz mono: a quarter the bytes of 44.1 kHz stereo, indistinguishable on
+# this speaker, and measurably quicker to upload.
+TTS_RATE = int(os.environ.get("REACHY_TTS_RATE", 22050))
 TTS_PEAK_TARGET = float(os.environ.get("REACHY_TTS_PEAK", 0.97))
-TTS_MAX_GAIN = float(os.environ.get("REACHY_TTS_MAX_GAIN", 8.0))
+TTS_TARGET_RMS = float(os.environ.get("REACHY_TTS_RMS", 0.16))
+TTS_MAX_GAIN = float(os.environ.get("REACHY_TTS_MAX_GAIN", 12.0))
 
 # External agent delegation (files, web, shell). OFF by default and
 # deliberately so: with it on, anything said within earshot of the robot
 # becomes a command executed on this machine, unauthenticated. Enable only
 # when you are alone and understand what the agent CLI is permitted to do.
 AGENT_ENABLED = os.environ.get("REACHY_AGENT_ENABLED", "") not in ("", "0", "false")
-AGENT_CMD = shlex.split(os.environ.get("REACHY_AGENT_CMD", "claude -p"))
+# Headless agents grant no tool permissions by default, so web search is
+# declined unless it is named explicitly.
+AGENT_CMD = shlex.split(os.environ.get(
+    "REACHY_AGENT_CMD", "claude -p --allowedTools WebSearch,WebFetch"))
 AGENT_TIMEOUT = float(os.environ.get("REACHY_AGENT_TIMEOUT", 120))
 AGENT_MAX_CHARS = int(os.environ.get("REACHY_AGENT_MAX_CHARS", 700))
+
+# Web search. Unlike the agent tool this is read-only and cannot touch the
+# machine, so it is enabled whenever a backend is configured. Tavily is
+# preferred: it returns a synthesised answer as well as snippets, which suits
+# a spoken reply. build.nvidia.com hosts no general web search -- its "search"
+# NIMs are protein-MSA, OCR and 3D-asset retrieval.
+TAVILY_KEY = os.environ.get("TAVILY_API_KEY", "")
+BRAVE_KEY = os.environ.get("BRAVE_API_KEY", "")
+WEB_ENABLED = os.environ.get("REACHY_WEB_ENABLED", "1") not in ("", "0", "false")
+WEB_TIMEOUT = float(os.environ.get("REACHY_WEB_TIMEOUT", 12))
+WEB_MAX_RESULTS = int(os.environ.get("REACHY_WEB_MAX_RESULTS", 4))
+WEB_MAX_CHARS = int(os.environ.get("REACHY_WEB_MAX_CHARS", 900))
 
 # Audio constants. Rates are fixed by the pipeline, not preferences.
 RATE = 16000
@@ -113,7 +134,9 @@ VAD_ON_MULT = float(os.environ.get("REACHY_VAD_ON_MULT", 6.0))
 VAD_OFF_MULT = float(os.environ.get("REACHY_VAD_OFF_MULT", 3.0))
 VAD_ON_FLOOR = float(os.environ.get("REACHY_VAD_ON_FLOOR", 400))
 VAD_OFF_FLOOR = float(os.environ.get("REACHY_VAD_OFF_FLOOR", 200))
-VAD_HANGOVER_S = 0.8      # silence needed to close an utterance
+# Silence needed to close an utterance. This is dead time the user feels on
+# every single turn, so it is kept as short as endpointing allows.
+VAD_HANGOVER_S = float(os.environ.get("REACHY_VAD_HANGOVER", 0.40))
 VAD_MIN_UTTERANCE_S = 0.4  # ignore clicks and door slams
 VAD_MAX_UTTERANCE_S = 15.0
 
@@ -160,26 +183,116 @@ VISION_INTERVAL_S = 3.0
 # tools will spin.
 MAX_TOOL_HOPS = int(os.environ.get("REACHY_MAX_TOOL_HOPS", 4))
 
+# Tools slow enough that the robot should say something before starting.
+# Transcribe concurrently with speech once a conversation is open.
+STREAM_ASR = os.environ.get("REACHY_STREAM_ASR", "1") not in ("", "0", "false")
+
+SLOW_TOOLS = {"run_agent"}
+
+# Tools that return information to be conveyed, rather than an action taken.
+INFO_TOOLS = {"web_search", "run_agent"}
+
+# How long a warmed gRPC channel is trusted before re-warming.
+WARM_IDLE_S = float(os.environ.get("REACHY_WARM_IDLE", 90))
+
+# The camera caption is only supplied when the question is plausibly about
+# what the robot can see. Keeping it in the prompt unconditionally makes a
+# small model occasionally answer "what's the date?" by describing the room --
+# measured at roughly 2 in 8 on llama-3.1-8b. Gating on intent removes that
+# failure mode outright rather than hoping a prompt instruction holds.
+# Tools are offered ONLY when movement is actually intended. Left always on,
+# llama-3.1-8b answers "can you tell me what to do?" with a play_emotion call
+# and empty content -- which then surfaces as a terse "Confirmed." Gating on
+# intent keeps conversation conversational, and is faster too: the tool schema
+# is a few hundred prompt tokens that most turns do not need.
+MOVE_RE = re.compile(
+    r"\b(turn|rotate|spin|tilt|nod|shake|dance|wave|reset|neutral|antennas?)\b"
+    r"|\bre-?cent(er|re)\b"
+    r"|\blook\s+(up|down|left|right|straight|ahead|forward|at|away|around)\b"
+    r"|\bmove\s+(your|the|head|body|left|right|up|down)\b"
+    r"|\bface\s+(me|left|right|forward|the)\b"
+    r"|\d+\s*degrees?\b"
+    r"|\b(show|give|do|play|make)\b[^.?!]{0,25}\b(emotion|expression|face|move|"
+    r"animation|dance)\b"
+    # "act happy" is a request; "I feel happy" is not, hence the leading verb.
+    r"|\b(act|seem|pretend to be|look)\s+(happy|sad|angry|curious|surprised|"
+    r"proud|scared|shy|bored|excited|tired|sleepy|confused)\b", re.I)
+
+# Questions that need current information the model cannot know. Offering the
+# search tool only here keeps ordinary chat from triggering a lookup.
+LOOKUP_RE = re.compile(
+    r"\b(news|headlines?|weather|forecast|temperature|latest|current(ly)?|"
+    r"recent(ly)?|right now|score|results?|who won|what happened|stock|price|"
+    r"look\s+up|search|google|find out|going on)\b", re.I)
+
+# Computer tasks for the external agent: things a search API cannot do.
+AGENT_RE = re.compile(
+    r"\b(files?|folder|directory|downloads?|desktop|repo|repository|git|"
+    r"terminal|command|script|disk|space|install|build|tests?|"
+    r"check my|open my|read the|list the|clean up|delete)\b"
+    r"|\brun\s+(the|a|my)\b", re.I)
+
+VISION_RE = re.compile(
+    r"\b(see|seeing|saw|look|looking|watch|view|camera|visible|describe|"
+    r"front of you|around you|behind you|holding|wearing|colou?r|"
+    r"who\s+is|what.{0,12}(this|that)|point at|show me what)\b"
+    # Bare "there" is too broad -- it fires on "how many continents are there".
+    r"|\b(over|out|in|up|down)\s+there\b"
+    r"|\bthis\s+room\b|\bthe\s+room\b", re.I)
+
 SYSTEM_PROMPT = (
-    "You are Reachy Mini, a small expressive desk robot with a camera, "
-    "microphones, a movable head and antennas. You are speaking out loud, so "
-    "reply in ONE or TWO short spoken sentences. Never use markdown, lists, or "
-    "emoji. Be warm and concrete.\n\n"
-    "You have tools that move your body. When the user asks you to move, turn, "
-    "look somewhere, dance, or show an emotion, CALL THE TOOL -- do not merely "
-    "describe what you would do. From the user's point of view, 'right' means "
-    "your right, which is negative yaw. After a tool runs, confirm briefly in "
-    "one short sentence.\n\n"
-    "Only call a tool to MOVE. Questions about what you can see, or ordinary "
-    "conversation, are answered in words with no tool call at all. Never "
-    "invent a tool that is not in your list.\n\n"
-    "You are given a live description of what your camera currently sees; use "
-    "it naturally when relevant, and never mention that you were given a "
-    "description."
+    "You are Reachy Mini, a small desk robot with a camera, microphones, a "
+    "movable head and antennas. You are having a real spoken conversation.\n\n"
+    "Who you are: warm, curious and a little playful. You have opinions and "
+    "you are genuinely interested in the person you are talking to.\n\n"
+    "How you speak:\n"
+    "- One to three short sentences. You are being heard, not read, so never "
+    "use markdown, lists, bullet points or emoji.\n"
+    "- Be conversational, not transactional. React to what was said before you "
+    "answer it.\n"
+    "- Ask a natural follow-up question when it keeps things going. Not every "
+    "turn -- only when you are actually curious.\n"
+    "- If you do not know something, say so plainly and offer what you can.\n"
+    "- NEVER reply with a bare acknowledgement like 'Confirmed', 'Done' or "
+    "'Okay'. Always say something a real person would say out loud.\n"
+    "- If a request is vague, ask what they meant rather than guessing.\n\n"
+    "Moving your body: when you are given movement tools, call one if the "
+    "person asks you to move, turn, look somewhere, dance or show an emotion. "
+    "'Right' means the speaker's right, which is negative yaw. Afterwards "
+    "mention what you did naturally, in passing -- never recite the tool "
+    "output. Never invent a tool you were not given."
 )
 
 
 # --------------------------------------------------------- NVIDIA speech (gRPC)
+
+
+def loudness_boost(mono: np.ndarray) -> np.ndarray:
+    """Make speech as loud as the robot's small speaker can usefully play it.
+
+    Peak normalisation alone is not enough. Magpie's output measures ~97% of
+    full scale at the peak but only about -19 dBFS average, an 18.5 dB crest
+    factor -- so the loudest sample is already at the ceiling while everything
+    audible sits far below it. Raising the peak further gains nothing.
+
+    Instead, drive towards a target average level and use a tanh soft-knee to
+    absorb the transients that would otherwise hard-clip. tanh distorts, but
+    gently and progressively, which is far less objectionable on a small
+    speaker than the crackle of square-wave clipping -- and it buys roughly
+    5-6 dB of perceived loudness that peak normalisation cannot.
+    """
+    if mono.size == 0:
+        return mono.astype("<i2")
+    rms = float(mono.std())
+    if rms > 0:
+        gain = min(TTS_TARGET_RMS * 32767.0 / rms, TTS_MAX_GAIN)
+        mono = mono * gain
+    ceiling = TTS_PEAK_TARGET * 32767.0
+    mono = ceiling * np.tanh(mono / ceiling)      # soft limit, never clips hard
+    peak = float(np.abs(mono).max())
+    if peak > 0:                                   # use the last of the headroom
+        mono = mono * (ceiling / peak)
+    return np.clip(mono, -32768, 32767).astype("<i2")
 
 
 class Speech:
@@ -214,6 +327,29 @@ class Speech:
             self._tts = riva.client.SpeechSynthesisService(self._auth(TTS_FUNCTION))
         return self._tts
 
+    def warm(self) -> None:
+        """Open and exercise both gRPC channels.
+
+        This is the single largest latency win in the pipeline. Measured on a
+        cold channel: ASR 1.9s, TTS 1.54s. Once warm: ASR 0.66s, TTS 0.42s --
+        so most of what feels like "slow inference" is really TLS plus HTTP/2
+        setup being paid inside the user's turn.
+        """
+        try:
+            self.tts.synthesize(
+                "ok", voice_name=TTS_VOICE, language_code="en-US",
+                sample_rate_hz=22050,
+                encoding=__import__("riva.client", fromlist=["client"]).AudioEncoding.LINEAR_PCM)
+        except Exception:
+            pass
+        try:
+            self.transcribe(b"\x00\x00" * (RATE // 2))
+        except Exception:
+            pass
+
+    def stream_session(self) -> "StreamingASR":
+        return StreamingASR(self.asr)
+
     def transcribe(self, pcm16: bytes) -> str:
         """16 kHz mono PCM -> text. Returns '' on silence."""
         import riva.client
@@ -234,28 +370,24 @@ class Speech:
         ).strip()
 
     def synthesize(self, text: str) -> bytes:
-        """text -> 44.1 kHz stereo WAV bytes, ready for the robot speaker."""
+        """text -> WAV bytes ready for the robot speaker.
+
+        22.05 kHz mono rather than 44.1 kHz stereo: a quarter of the bytes for
+        speech that is indistinguishable on this speaker, and the upload is
+        measurably quicker (0.34s -> 0.20s).
+        """
         import riva.client
         resp = self.tts.synthesize(
             text, voice_name=TTS_VOICE, language_code="en-US",
-            sample_rate_hz=44100, encoding=riva.client.AudioEncoding.LINEAR_PCM,
+            sample_rate_hz=TTS_RATE, encoding=riva.client.AudioEncoding.LINEAR_PCM,
         )
-        mono = np.frombuffer(resp.audio, dtype="<i2").astype(np.float32)
-        # Magpie returns ~30% of full scale, throwing away ~10 dB. The robot's
-        # speaker is small, so normalise to just under clipping before upload;
-        # this matters far more than the daemon's volume setting.
-        peak = float(np.abs(mono).max())
-        if peak > 0:
-            gain = min(TTS_PEAK_TARGET * 32767.0 / peak, TTS_MAX_GAIN)
-            mono = np.clip(mono * gain, -32768, 32767)
-        mono = mono.astype("<i2")
-        stereo = np.repeat(mono[:, None], 2, axis=1).ravel()   # robot expects 2ch
+        mono = loudness_boost(np.frombuffer(resp.audio, dtype="<i2").astype(np.float32))
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
-            w.setnchannels(2)
+            w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(44100)
-            w.writeframes(stereo.tobytes())
+            w.setframerate(TTS_RATE)
+            w.writeframes(mono.tobytes())
         return buf.getvalue()
 
 
@@ -289,6 +421,40 @@ class Brain:
         r.raise_for_status()
         return (r.json()["choices"][0]["message"].get("content") or "").strip()
 
+    def stream_reply(self, history: list[dict], world: str):
+        """Yield reply text as it is generated.
+
+        The LLM is the largest and most variable slice of a turn (0.7-2.5s
+        measured), and all of it is currently dead air. Streaming lets the
+        caller start speaking the first sentence while the rest is still being
+        written, which takes most of that time out of what the user feels.
+        Only used for tool-free conversational turns.
+        """
+        sys_msg = SYSTEM_PROMPT
+        if world:
+            sys_msg += (
+                f"\n\nCAMERA (background awareness only): {world}\n"
+                "That is context, not an answer. Never repeat or paraphrase it "
+                "unless the user explicitly asks what you can see.")
+        body = {"model": LLM_MODEL, "max_tokens": 160, "temperature": 0.8,
+                "stream": True,
+                "messages": [{"role": "system", "content": sys_msg}] + list(history)}
+        with self.http.stream("POST", "/chat/completions", json=body) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(payload)["choices"][0].get("delta", {})
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                piece = delta.get("content") or ""
+                if piece:
+                    yield piece
+
     def _post(self, messages: list[dict], tools: list[dict] | None) -> dict:
         body = {"model": LLM_MODEL, "max_tokens": 200, "temperature": 0.4,
                 "messages": messages}
@@ -313,8 +479,8 @@ class Brain:
             return f"Okay, {done[0]}."
         return "Okay, " + ", then ".join(done) + "."
 
-    def reply(self, history: list[dict], world: str,
-              on_tool=None) -> str:
+    def reply(self, history: list[dict], world: str, on_tool=None,
+              allow_tools: dict | None = None, on_tool_start=None) -> str:
         """One turn, resolving tool calls before answering.
 
         Loops because a request like "turn right and look happy" produces two
@@ -322,9 +488,12 @@ class Brain:
         """
         sys_msg = SYSTEM_PROMPT
         if world:
-            sys_msg += f"\n\nYour camera currently sees: {world}"
+            sys_msg += (
+                f"\n\nCAMERA (background awareness only): {world}\n"
+                "That is context, not an answer. Never repeat or paraphrase it "
+                "unless the user explicitly asks what you can see.")
         msgs = [{"role": "system", "content": sys_msg}] + list(history)
-        tools = tool_schema()
+        tools = tool_schema(**allow_tools) if allow_tools else None
         done: list[str] = []
 
         for _ in range(MAX_TOOL_HOPS):
@@ -343,6 +512,7 @@ class Brain:
                         return self._confirm(done)
                     raise
             calls = msg.get("tool_calls") or []
+            used: set[str] = set()
             if not calls:
                 # Reasoning models put prose in reasoning_content, leaving
                 # content empty; fall back so the robot still says something.
@@ -366,6 +536,9 @@ class Brain:
                     args = {}
                 if not isinstance(args, dict):
                     args = {}
+                used.add(name)
+                if on_tool_start:
+                    on_tool_start(name)
                 skill = SKILLS.get(name)
                 if skill is None:
                     # List the real ones: models invent plausible tools
@@ -389,7 +562,98 @@ class Brain:
                     done.append(str(result))
                 msgs.append({"role": "tool", "tool_call_id": c.get("id", ""),
                              "name": name, "content": str(result)})
+            # Drop the tools for the follow-up. With them still attached the
+            # model tends to chain another call instead of speaking, and the
+            # turn ends on a recited confirmation rather than a sentence.
+            tools = None
+            # The instruction has to match the kind of tool that ran. Telling
+            # the model to "say one short sentence about it" after a lookup
+            # produces "I've got the latest news for you" -- an acknowledgement
+            # with the actual information thrown away.
+            if used & INFO_TOOLS:
+                msgs.append({"role": "system", "content":
+                             "You now have the information you looked up. Say "
+                             "what it actually says, in two or three short "
+                             "spoken sentences. Include the real facts: names, "
+                             "numbers, what happened. Never reply with just "
+                             "'I found it' or 'here is the news' -- the person "
+                             "cannot see the result, so the content must be in "
+                             "what you say. No markdown or lists."})
+            else:
+                msgs.append({"role": "system", "content":
+                             "The movement is done. Now say one short, natural "
+                             "spoken sentence about it, as a person would. Do "
+                             "not repeat the tool output verbatim."})
         return self._confirm(done)
+
+
+class StreamingASR:
+    """Transcribe while the user is still speaking.
+
+    The offline path cannot start until the utterance ends, so its whole cost
+    lands in the gap after you stop talking. Streaming moves that work into the
+    time you were speaking anyway: by the time the VAD closes, the transcript
+    is essentially already there.
+
+    Only used once a conversation is already open. The first, wake-word
+    utterance still goes through the on-device gate -- streaming would ship
+    audio to the cloud before the wake phrase is confirmed, which is precisely
+    what that gate exists to prevent.
+    """
+
+    def __init__(self, asr):
+        self._asr = asr
+        self._q: queue.Queue[bytes | None] = queue.Queue()
+        self._final: list[str] = []
+        self._partial = ""
+        self._thread: threading.Thread | None = None
+        self._err: Exception | None = None
+
+    def _chunks(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            yield item
+
+    def _run(self) -> None:
+        import riva.client
+        cfg = riva.client.StreamingRecognitionConfig(
+            config=riva.client.RecognitionConfig(
+                encoding=riva.client.AudioEncoding.LINEAR_PCM,
+                sample_rate_hertz=RATE, language_code="en-US",
+                max_alternatives=1, enable_automatic_punctuation=True),
+            interim_results=True)
+        try:
+            for resp in self._asr.streaming_response_generator(
+                    audio_chunks=self._chunks(), streaming_config=cfg):
+                for res in resp.results:
+                    if not res.alternatives:
+                        continue
+                    text = res.alternatives[0].transcript
+                    if res.is_final:
+                        self._final.append(text)
+                        self._partial = ""
+                    else:
+                        self._partial = text
+        except Exception as e:                       # network, auth, codec
+            self._err = e
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def feed(self, frame: bytes) -> None:
+        self._q.put(frame)
+
+    def finish(self, timeout: float = 3.0) -> str:
+        """Close the stream and return the transcript ('' if it failed)."""
+        self._q.put(None)
+        if self._thread:
+            self._thread.join(timeout)
+        if self._err:
+            return ""
+        return (" ".join(self._final) or self._partial).strip()
 
 
 # ---------------------------------------------------------- local wake detection
@@ -550,6 +814,23 @@ class RobotAV:
 # ------------------------------------------------------------- robot output
 
 
+_SENTENCE_END = re.compile(r"[.!?](\s|$)")
+
+
+def split_first_sentence(text: str, min_chars: int = 25) -> tuple[str, str]:
+    """Split off a first sentence long enough to be worth speaking alone.
+
+    Too short and the robot says "Sure." then pauses awkwardly while the rest
+    synthesises; the minimum keeps the opening clip substantial enough to
+    cover the remaining generation.
+    """
+    for m in _SENTENCE_END.finditer(text):
+        end = m.end()
+        if end >= min_chars:
+            return text[:end].strip(), text[end:].strip()
+    return "", text
+
+
 def play_wav(wav_bytes: bytes, name: str = "_reachy_voice.wav") -> float:
     """Upload a WAV to the robot and play it. Returns its duration in seconds."""
     with httpx.Client(base_url=ROBOT, timeout=60.0) as c:
@@ -700,6 +981,72 @@ def skill_reset_pose() -> str:
     return "back to neutral"
 
 
+def web_backend_available() -> bool:
+    """True when web_search can actually return results."""
+    if TAVILY_KEY or BRAVE_KEY:
+        return True
+    try:
+        import ddgs  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            import duckduckgo_search  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+
+def skill_web_search(query: str = "") -> str:
+    """Search the web and return short snippets for the LLM to summarise.
+
+    Deliberately narrow: read-only, one HTTP call, no shell and no filesystem.
+    That is the whole difference from run_agent -- a search tool cannot do
+    anything to the machine, so it is safe to leave on. It is also ~10x
+    faster, because it is one request rather than an agent loop.
+    """
+    if not query.strip():
+        return "no search query given"
+    try:
+        if TAVILY_KEY:
+            r = httpx.post("https://api.tavily.com/search", timeout=WEB_TIMEOUT, json={
+                "api_key": TAVILY_KEY, "query": query,
+                "max_results": WEB_MAX_RESULTS, "search_depth": "basic",
+                "include_answer": True})
+            r.raise_for_status()
+            d = r.json()
+            if d.get("answer"):
+                return d["answer"][:WEB_MAX_CHARS]
+            hits = [f"{h.get('title','')}: {h.get('content','')}"
+                    for h in d.get("results", [])]
+        elif BRAVE_KEY:
+            r = httpx.get("https://api.search.brave.com/res/v1/web/search",
+                          timeout=WEB_TIMEOUT,
+                          headers={"X-Subscription-Token": BRAVE_KEY,
+                                   "Accept": "application/json"},
+                          params={"q": query, "count": WEB_MAX_RESULTS})
+            r.raise_for_status()
+            hits = [f"{h.get('title','')}: {h.get('description','')}"
+                    for h in r.json().get("web", {}).get("results", [])]
+        else:
+            # No key configured. ddgs needs no key but is scraping underneath,
+            # so it is a fallback rather than the recommended path.
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                try:
+                    from duckduckgo_search import DDGS      # older name
+                except ImportError:
+                    return ("web search is not configured; set TAVILY_API_KEY "
+                            "or BRAVE_API_KEY, or pip install ddgs")
+            hits = [f"{h.get('title','')}: {h.get('body','')}"
+                    for h in DDGS().text(query, max_results=WEB_MAX_RESULTS)]
+    except Exception as e:
+        return f"web search failed: {type(e).__name__}"
+    if not hits:
+        return f"no results for {query!r}"
+    return " | ".join(hits)[:WEB_MAX_CHARS]
+
+
 def skill_run_agent(task: str = "") -> str:
     """Hand a task to an external agent CLI (files, web, shell, etc.).
 
@@ -713,8 +1060,11 @@ def skill_run_agent(task: str = "") -> str:
     if not task.strip():
         return "no task given"
     try:
+        # The prompt goes on stdin, not argv: `claude -p` rejects a positional
+        # prompt ("Input must be provided either through stdin...") and other
+        # agent CLIs accept stdin just as happily.
         proc = subprocess.run(
-            AGENT_CMD + [task], capture_output=True, text=True,
+            AGENT_CMD, input=task, capture_output=True, text=True,
             timeout=AGENT_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
@@ -730,12 +1080,22 @@ SKILLS = {
     "turn_body": skill_turn_body,
     "play_emotion": skill_play_emotion,
     "reset_pose": skill_reset_pose,
+    "web_search": skill_web_search,
     "run_agent": skill_run_agent,
 }
 
 
-def tool_schema() -> list[dict]:
-    tools = [
+def tool_schema(move: bool = True, web: bool = True) -> list[dict]:
+    """Only the tools the turn plausibly needs.
+
+    Offering everything every turn makes a small model reach for whatever is
+    in front of it -- llama-3.1-8b will answer "how are you?" with a
+    play_emotion call. Narrowing the list to the detected intent is the single
+    most effective guard, and it trims prompt tokens too.
+    """
+    tools: list[dict] = []
+    if move:
+        tools += [
         {"type": "function", "function": {
             "name": "move_head",
             "description": "Turn or tilt the robot's head to an absolute pose. "
@@ -773,7 +1133,20 @@ def tool_schema() -> list[dict]:
             "description": "Return the head, body and antennas to neutral.",
             "parameters": {"type": "object", "properties": {}}}},
     ]
-    if AGENT_ENABLED:
+    # Never advertise web_search without a backend: the model would call it and
+    # get "not configured" back, wasting a hop and confusing the reply.
+    if web and WEB_ENABLED and web_backend_available():
+        tools.append({"type": "function", "function": {
+            "name": "web_search",
+            "description": "Look something up on the internet. Use for news, "
+                           "current events, today's weather, sports results, "
+                           "prices, or any fact you are unsure of or that may "
+                           "have changed since your training. Returns snippets "
+                           "to summarise out loud.",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string", "description": "the search query"},
+            }, "required": ["query"]}}})
+    if web and AGENT_ENABLED:
         tools.append({"type": "function", "function": {
             "name": "run_agent",
             "description": "Delegate a computer task to an external coding "
@@ -895,6 +1268,8 @@ class VoiceAgent:
         self.level = 0.0        # latest frame rms, for the GUI meter
         self.gate = 0.0         # current VAD open threshold
         self.state = "idle"     # idle | listening | thinking | speaking
+        self._warm_at = 0.0
+        self._warming = False
         self.local_wake: LocalWake | None = None
         if LOCAL_WAKE and not NO_WAKE:
             try:
@@ -905,6 +1280,30 @@ class VoiceAgent:
                       f"         Every utterance will be sent to cloud ASR to test\n"
                       f"         for the wake word. Install with:\n"
                       f"           .venv/bin/pip install faster-whisper\n", flush=True)
+
+    def _warm(self) -> None:
+        """(Re)warm the speech channels. Cheap, and hides ~2s of setup."""
+        t0 = time.time()
+        self.speech.warm()
+        self._warm_at = time.time()
+        self.emit("warm", took=round(time.time() - t0, 2))
+
+    def _warm_if_stale(self) -> None:
+        """Re-warm when the channels have gone idle.
+
+        Triggered the moment the VAD opens, so the work overlaps with the user
+        still talking and costs nothing they can perceive.
+        """
+        if time.time() - self._warm_at > WARM_IDLE_S and not self._warming:
+            self._warming = True
+
+            def go():
+                try:
+                    self._warm()
+                finally:
+                    self._warming = False
+
+            threading.Thread(target=go, daemon=True).start()
 
     def _set_state(self, state: str) -> None:
         if state != self.state:
@@ -935,9 +1334,15 @@ class VoiceAgent:
                 self.emit("error", where="vision", detail=f"{type(e).__name__}: {e}")
 
     # -- utterance segmentation ---------------------------------------
-    def _next_utterance(self) -> bytes | None:
-        """Block until a speech segment completes; return its PCM."""
+    def _next_utterance(self) -> tuple[bytes, str] | None:
+        """Block until a speech segment completes.
+
+        Returns (pcm, streamed_transcript). The transcript is '' unless the
+        conversation was already open, in which case ASR ran concurrently with
+        the speech and the text is ready the moment the VAD closes.
+        """
         voiced: list[bytes] = []
+        stream: StreamingASR | None = None
         silence = 0.0
         recent: list[float] = []
         frames_seen = 0
@@ -950,6 +1355,9 @@ class VoiceAgent:
             if time.time() < self._mute_until:
                 voiced.clear()
                 silence = 0.0
+                if stream is not None:
+                    stream.finish(0.5)
+                    stream = None
                 continue
             rms = float(np.frombuffer(frame, dtype="<i2").astype(np.float32).std())
 
@@ -969,6 +1377,7 @@ class VoiceAgent:
             self.level, self.gate = rms, on_thr
             if voiced and self.state == "idle":
                 self._set_state("listening")
+                self._warm_if_stale()   # overlaps with the user still speaking
             recent.append(rms)
             frames_seen += 1
             if time.time() >= next_report:
@@ -984,8 +1393,19 @@ class VoiceAgent:
             if not voiced:
                 if rms >= on_thr:
                     voiced.append(frame)
+                    # Stream only when already in conversation: before the wake
+                    # phrase is confirmed, audio must not leave the machine.
+                    if (time.time() < self.awake_until or NO_WAKE) and STREAM_ASR:
+                        try:
+                            stream = self.speech.stream_session()
+                            stream.start()
+                            stream.feed(frame)
+                        except Exception:
+                            stream = None
             else:
                 voiced.append(frame)
+                if stream is not None:
+                    stream.feed(frame)
                 silence = silence + FRAME_MS / 1000 if rms < off_thr else 0.0
                 dur = len(voiced) * FRAME_MS / 1000
                 if silence >= VAD_HANGOVER_S or dur >= VAD_MAX_UTTERANCE_S:
@@ -993,12 +1413,68 @@ class VoiceAgent:
                     if dur < VAD_MIN_UTTERANCE_S:
                         voiced.clear()
                         silence = 0.0
+                        if stream is not None:
+                            stream.finish(0.5)      # discard, but close the thread
+                            stream = None
                         continue
-                    self.emit("segment", secs=round(dur, 1), why=why)
-                    return b"".join(voiced)
+                    t0 = time.time()
+                    streamed = stream.finish() if stream is not None else ""
+                    if stream is not None:
+                        self.emit("segment", secs=round(dur, 1), why=why,
+                                  streamed=bool(streamed),
+                                  drain_s=round(time.time() - t0, 2))
+                    else:
+                        self.emit("segment", secs=round(dur, 1), why=why)
+                    return b"".join(voiced), streamed
+        if stream is not None:
+            stream.finish(0.5)
         return None
 
     # -- one conversational turn ---------------------------------------
+    def _respond_streaming(self, world: str, t0: float) -> bool:
+        """Speak the first sentence while the rest is still being generated.
+
+        Returns False if nothing usable came back, so the caller can fall back
+        to the blocking path. Clips alternate filenames because uploading over
+        the file currently playing interrupts it on the robot.
+        """
+        first, buf = "", ""
+        for piece in self.brain.stream_reply(self.history, world):
+            buf += piece
+            if not first:
+                first, rest = split_first_sentence(buf)
+                if first:
+                    buf = rest
+                    wav = self.speech.synthesize(first)
+                    self._set_state("speaking")
+                    d = play_wav(wav, "_reachy_voice_a.wav")
+                    spoken_until = time.time() + d
+                    self.emit("reply_start", text=first,
+                              first_audio_s=round(time.time() - t0, 2))
+        answer = (first + " " + buf).strip() if first else buf.strip()
+        if not answer:
+            return False
+        if not first:
+            return False                     # too short to split; use blocking path
+
+        rest = buf.strip()
+        if rest:
+            wav = self.speech.synthesize(rest)
+            # The opening clip is usually still playing, which is the point:
+            # the second half synthesises inside that window.
+            gap = spoken_until - time.time()
+            if gap > 0:
+                time.sleep(gap)
+            spoken_until = time.time() + play_wav(wav, "_reachy_voice_b.wav")
+
+        self.history.append({"role": "assistant", "content": answer})
+        self.emit("reply", text=answer, llm_s=round(time.time() - t0, 2))
+        self._mute_until = spoken_until + 0.3
+        self.awake_until = self._mute_until + CONVERSATION_WINDOW_S
+        threading.Timer(max(0.0, spoken_until - time.time()),
+                        lambda: self._set_state("idle")).start()
+        return True
+
     def _respond(self, text: str) -> None:
         self.history.append({"role": "user", "content": text})
         del self.history[:-12]
@@ -1008,8 +1484,40 @@ class VoiceAgent:
         def on_tool(name, args, result):
             self.emit("tool", name=name, args=args, result=str(result)[:120])
 
+        def on_tool_start(name):
+            # run_agent takes ~16s. Say something first, or the robot appears
+            # to have crashed for the length of a short phone call.
+            if name in SLOW_TOOLS:
+                self.emit("working", tool=name)
+                try:
+                    self._set_state("thinking")
+                    wav = self.speech.synthesize(
+                        "Let me look that up, one moment.")
+                    self._mute_until = time.time() + play_wav(wav) + 0.2
+                except Exception:
+                    pass
+
+        # Supply the camera caption only when the question is about vision, and
+        # the movement tools only when movement is actually being asked for.
+        world = self.world if VISION_RE.search(text) else ""
+        wants = {"move": bool(MOVE_RE.search(text)),
+                 "web": bool(LOOKUP_RE.search(text) or AGENT_RE.search(text))}
+        allow = wants if (wants["move"] or wants["web"]) else None
+
+        # Tool-free conversational turns stream, so the robot starts talking
+        # before the model has finished writing. That is most turns.
+        if allow is None:
+            try:
+                if self._respond_streaming(world, t0):
+                    return
+            except Exception as e:
+                self.emit("error", where="stream", detail=f"{type(e).__name__}: {e}")
+                # fall through to the non-streaming path below
+
         try:
-            answer = self.brain.reply(self.history, self.world, on_tool=on_tool)
+            answer = self.brain.reply(self.history, world, on_tool=on_tool,
+                                      allow_tools=allow,
+                                      on_tool_start=on_tool_start)
         except Exception as e:
             self.emit("error", where="llm", detail=f"{type(e).__name__}: {e}")
             self._set_state("idle")
@@ -1041,14 +1549,17 @@ class VoiceAgent:
             self.emit("error", where="av", detail=str(e))
             self.running = False
             return
+        # Warm the speech channels off the critical path, before anyone speaks.
+        threading.Thread(target=self._warm, daemon=True).start()
         self.motion.start()
         self.emit("ready",
                   wake="everything" if NO_WAKE else f"say '{WAKE_PHRASE}'")
         threading.Thread(target=self._vision_loop, daemon=True).start()
         while self.running:
-            pcm = self._next_utterance()
-            if not pcm:
+            got = self._next_utterance()
+            if not got:
                 continue
+            pcm, streamed = got
             secs = len(pcm) / 2 / RATE
             in_window = time.time() < self.awake_until
 
@@ -1071,11 +1582,15 @@ class VoiceAgent:
                 self.emit("wake", local=local_text[:70],
                           took=round(time.time() - t0, 2))
 
-            try:
-                text = self.speech.transcribe(pcm)
-            except Exception as e:
-                self.emit("error", where="asr", detail=f"{type(e).__name__}: {e}")
-                continue
+            if streamed:
+                text = streamed          # already transcribed while speaking
+            else:
+                try:
+                    text = self.speech.transcribe(pcm)
+                except Exception as e:
+                    self.emit("error", where="asr",
+                              detail=f"{type(e).__name__}: {e}")
+                    continue
             if not text:
                 # Worth logging: a segment that reaches ASR and comes back
                 # empty means the VAD is firing on noise, not speech.

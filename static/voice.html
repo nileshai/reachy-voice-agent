@@ -66,6 +66,17 @@
     background: transparent; color: var(--dim); border-color: var(--line);
   }
   .ghost:hover { color: var(--text); border-color: #37423c; }
+  .power-state {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--dim); font-weight: 600;
+  }
+  .power-state[data-p="running"] { color: var(--accent); }
+  .power-state[data-p="stopped"] { color: var(--warn); }
+  .power-state[data-p="offline"] { color: var(--err); }
+  .power { background: #2a2438; color: #c3b0e8; border-color: #413660; }
+  .power:hover:not(:disabled) { background: #362e48; }
+  .power.on { background: transparent; color: var(--warn); border-color: #4a3f22; }
+  .power.on:hover:not(:disabled) { background: #241f10; }
   .talk { background: #1c3350; color: #9ccdf5; border-color: #27496f; }
   .talk:hover:not(:disabled) { background: #244066; }
   .talk.armed {
@@ -181,7 +192,9 @@
   <h1><span class="dot" id="dot"></span> Reachy Voice Assistant</h1>
   <span class="state" id="state" data-s="off">off</span>
   <div class="spacer"></div>
+  <span class="power-state" id="pstate" data-p="unknown">robot ?</span>
   <button class="ghost" id="clear">Clear</button>
+  <button class="power" id="power">Wake robot</button>
   <button class="talk" id="talk" disabled>Talk to Reachy</button>
   <button id="toggle">Start conversation</button>
 </header>
@@ -271,6 +284,57 @@ $('toggle').onclick = async () => {
 };
 
 $('clear').onclick = () => { $('log').innerHTML = ''; };
+
+let robotState = 'unknown', powerBusy = false;
+
+$('power').onclick = async () => {
+  if (powerBusy) return;
+  const turningOn = robotState !== 'running';
+  // Stopping the daemon while the agent holds the camera leaves a stranded
+  // gstreamer process, so stop the conversation first.
+  if (!turningOn && running) {
+    try { await api('/stop', { method: 'POST' }); detachStream(); } catch (e) {}
+  }
+  powerBusy = true;
+  $('power').disabled = true;
+  $('power').textContent = turningOn ? 'Waking…' : 'Shutting down…';
+  sys(turningOn ? 'starting daemon, enabling motors, waking…'
+                : 'parking in sleep pose, stopping daemon…');
+  try {
+    const r = await fetch('/api/power/' + (turningOn ? 'on' : 'off'), { method: 'POST' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    sys(turningOn ? 'robot awake' : 'robot asleep — daemon stopped');
+  } catch (e) {
+    sys('power command failed: ' + e.message, 'err');
+  }
+  powerBusy = false;
+  $('power').disabled = false;
+  pollPower();
+};
+
+async function pollPower() {
+  try {
+    const r = await fetch('/api/power/status');
+    const p = await r.json();
+    robotState = p.reachable ? (p.state || 'unknown') : 'offline';
+    $('pstate').textContent = 'robot ' + robotState;
+    $('pstate').dataset.p = robotState;
+    if (!powerBusy) {
+      const on = robotState === 'running';
+      $('power').textContent = on ? 'Shut down robot' : 'Wake robot';
+      $('power').classList.toggle('on', on);
+      $('power').disabled = robotState === 'offline';
+      // The agent cannot start without the daemon; make that obvious rather
+      // than letting Start fail with a preflight error.
+      $('toggle').disabled = !on && !running;
+      $('toggle').title = on ? '' : 'Wake the robot first';
+    }
+  } catch (e) {
+    robotState = 'offline';
+    $('pstate').textContent = 'robot offline';
+    $('pstate').dataset.p = 'offline';
+  }
+}
 
 $('talk').onclick = async () => {
   try {
@@ -382,7 +446,9 @@ async function pollEvents() {
 
 setInterval(pollStatus, 450);
 setInterval(pollEvents, 700);
+setInterval(pollPower, 2500);   // power state changes slowly; no need to spam
 pollStatus();
+pollPower();
 </script>
 </body>
 </html>
