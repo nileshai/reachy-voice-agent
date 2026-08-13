@@ -451,10 +451,15 @@ async function pollEvents() {
       if (e.kind === 'heard')        msg('You', e.text, e.secs + 's');
       else if (e.kind === 'reply')   msg('Reachy', e.text, 'llm ' + e.llm_s + 's');
       else if (e.kind === 'wake')    sys('wake detected locally: "' + e.local + '" (' + e.took + 's)', 'wake');
+      else if (e.kind === 'working') sys('looking that up…' + (e.tool === 'run_agent' ? ' (agent — this one is slow)' : ''), 'wake');
+      else if (e.kind === 'filler')  sys('…' + e.text, 'ignored');
+      else if (e.kind === 'tool')    sys('got a result from ' + e.name, 'ignored');
       else if (e.kind === 'unaddressed') unaddressed(e.text);
       else if (e.kind === 'ignored') sys('ignored, no wake word: "' + e.local + '"', 'ignored');
       else if (e.kind === 'empty')   sys('background noise, no speech (' + e.secs + 's)', 'ignored');
       else if (e.kind === 'noise')   sys('noise rejected before ASR (' + e.secs + 's, level ' + e.median + ' < ' + e.needed + ')', 'ignored');
+      else if (e.kind === 'tooshort') sys('too short to process (' + e.secs + 's, need ' + e.needed + 's) — say a little more after "' + wakePhrase + '"', 'ignored');
+      else if (e.kind === 'session_reset') sys('conversation cleared after ' + Math.round(e.idle_s/60) + ' min idle');
       else if (e.kind === 'error')   sys('error in ' + e.where + ': ' + e.detail, 'err');
       else if (e.kind === 'ready')   sys('ready — wake: ' + e.wake);
     }

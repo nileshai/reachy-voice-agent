@@ -181,7 +181,12 @@ VAD_MIN_MEDIAN_MULT = float(os.environ.get("REACHY_VAD_MEDIAN_MULT", 0.75))
 # Silence needed to close an utterance. This is dead time the user feels on
 # every single turn, so it is kept as short as endpointing allows.
 VAD_HANGOVER_S = float(os.environ.get("REACHY_VAD_HANGOVER", 0.40))
-VAD_MIN_UTTERANCE_S = 0.4  # ignore clicks and door slams
+# A bare "hey" measures ~0.4s, exactly the old cutoff, so the wake word was
+# being discarded before the detector ever saw it -- which reads as "the wake
+# word works sometimes". The detector itself is robust: 0/9 missed at quarter
+# volume and 8 dB SNR. Sustained-energy screening (below) is what rejects
+# clicks now, so this can be short.
+VAD_MIN_UTTERANCE_S = float(os.environ.get("REACHY_VAD_MIN_UTTERANCE", 0.22))
 VAD_MAX_UTTERANCE_S = 15.0
 
 # Wake phrase. "hey" is the default because it is short and easy to say, but
@@ -234,7 +239,9 @@ VLM_TIMEOUT = float(os.environ.get("REACHY_VLM_TIMEOUT", 12))
 # A tool call may itself trigger a follow-up call ("turn right and look
 # happy"), so allow a few hops -- but cap them, or a model that keeps calling
 # tools will spin.
-MAX_TOOL_HOPS = int(os.environ.get("REACHY_MAX_TOOL_HOPS", 4))
+MAX_TOOL_HOPS = int(os.environ.get("REACHY_MAX_TOOL_HOPS", 3))
+# One lookup answers one question; batching several is pure latency.
+MAX_CALLS_PER_TURN = int(os.environ.get("REACHY_MAX_CALLS", 1))
 
 # Tools slow enough that the robot should say something before starting.
 # Transcribe concurrently with speech once a conversation is open.
@@ -266,6 +273,9 @@ FILLER_LINES = [
     "Just pulling the last of it together.",
 ]
 FILLER_GAP_S = float(os.environ.get("REACHY_FILLER_GAP", 1.2))
+# Wait this long before saying anything. A Tavily lookup often returns inside
+# it, and silence beats an announcement that outlasts the search.
+FILLER_DELAY_S = float(os.environ.get("REACHY_FILLER_DELAY", 1.3))
 
 SLOW_TOOLS = {"run_agent"}
 
@@ -719,6 +729,16 @@ class Brain:
                 # Models often quote a tool result verbatim; the quote marks
                 # are noise once this is spoken aloud.
                 return text.strip().strip('"').strip("'").strip()
+            # One lookup answers one question. The model will otherwise batch
+            # several in a single turn -- three web_searches plus a run_agent
+            # was measured at 45s where one search took 4s.
+            if len(calls) > MAX_CALLS_PER_TURN:
+                info = [c for c in calls
+                        if (c.get("function") or {}).get("name") in INFO_TOOLS]
+                if info:
+                    calls = info[:MAX_CALLS_PER_TURN]
+                else:
+                    calls = calls[:MAX_CALLS_PER_TURN]
             msgs.append({"role": "assistant", "content": msg.get("content") or "",
                          "tool_calls": calls})
             for c in calls:
@@ -1367,7 +1387,8 @@ def parse_text_tool_call(content: str) -> list[dict]:
     return out
 
 
-def tool_schema(move: bool = True, web: bool = True) -> list[dict]:
+def tool_schema(move: bool = True, web: bool = True,
+                agent: bool | None = None) -> list[dict]:
     """Only the tools the turn plausibly needs.
 
     Offering everything every turn makes a small model reach for whatever is
@@ -1375,6 +1396,12 @@ def tool_schema(move: bool = True, web: bool = True) -> list[dict]:
     play_emotion call. Narrowing the list to the detected intent is the single
     most effective guard, and it trims prompt tokens too.
     """
+    if agent is None:
+        agent = web            # callers that predate the split
+    # Without a search backend the agent CLI is the only way to look anything
+    # up, so fall back to it rather than offering nothing.
+    if web and not web_backend_available():
+        agent = True
     tools: list[dict] = []
     if move:
         tools += [
@@ -1428,7 +1455,10 @@ def tool_schema(move: bool = True, web: bool = True) -> list[dict]:
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "the search query"},
             }, "required": ["query"]}}})
-    if web and AGENT_ENABLED:
+    # run_agent is offered only for genuine computer tasks, never for a plain
+    # lookup. It takes 25-45s against web_search's ~4s, and given both the
+    # model will happily reach for the slow one -- or call both.
+    if agent and AGENT_ENABLED:
         tools.append({"type": "function", "function": {
             "name": "run_agent",
             "description": "Delegate a computer task to an external coding "
@@ -1606,26 +1636,26 @@ class VoiceAgent:
         def run():
             said = 0
             try:
-                # Contextual opener, generated while the lookup is already in
-                # flight so it costs no extra wall-clock.
-                try:
-                    opener = self.brain.reply(
-                        [{"role": "user", "content":
-                          f"I just asked you: {question!r}. You are looking it "
-                          "up now and it takes a few seconds. Say ONE short "
-                          "spoken sentence to fill the pause -- acknowledge "
-                          "what you are checking and add a brief related "
-                          "thought. Do not answer the question itself."}],
-                        "", allow_tools=None)
-                except Exception:
-                    opener = "Let me look that up for you."
+                # Hold off: if the result lands inside this window there is
+                # nothing to cover, and staying quiet is better than talking
+                # over the answer.
+                if self._filler_stop.wait(FILLER_DELAY_S):
+                    return
+                # A short canned opener, not a generated one. Generating it
+                # costs an LLM round-trip, and a fast lookup finishes inside
+                # that -- so the robot ended up announcing a search that had
+                # already returned. The contextual line comes second, by which
+                # point we know this lookup is genuinely slow.
+                opener = "Let me check that for you."
                 for line in [opener] + FILLER_LINES:
                     if self._filler_stop.is_set():
                         return
                     try:
                         wav = self.speech.synthesize(line)
-                        if not wav:
-                            continue
+                        # Re-check: synthesis takes ~0.4s, and the result can
+                        # land inside it. Speaking now would talk over it.
+                        if not wav or self._filler_stop.is_set():
+                            return
                         self._set_state("speaking")
                         dur = play_wav(wav, f"_reachy_fill_{said % 2}.wav")
                         self._mute_until = time.time() + PLAY_GUARD_S
@@ -1807,6 +1837,9 @@ class VoiceAgent:
                 if silence >= VAD_HANGOVER_S or dur >= VAD_MAX_UTTERANCE_S:
                     why = "silence" if silence >= VAD_HANGOVER_S else "maxlen"
                     if dur < VAD_MIN_UTTERANCE_S:
+                        # Was silent, which made a dropped wake word invisible.
+                        self.emit("tooshort", secs=round(dur, 2),
+                                  needed=VAD_MIN_UTTERANCE_S)
                         voiced.clear()
                         silence = 0.0
                         if stream is not None:
@@ -1928,9 +1961,11 @@ class VoiceAgent:
             self.emit("tool", name=name, args=args, result=str(result)[:120])
 
         def on_tool_start(name):
-            # A lookup takes ~27s. One line then silence reads as a crash, so
-            # keep talking until the result arrives.
-            if name in SLOW_TOOLS:
+            # Any lookup gets the filler, but it holds off for a beat first:
+            # speaking "let me look that up" takes longer than a 2s Tavily
+            # search, so announcing every one would make the fast path slower
+            # and choppier. Slow lookups still get covered.
+            if name in INFO_TOOLS:
                 self.emit("working", tool=name)
                 self._start_filler(text)
 
@@ -1943,7 +1978,8 @@ class VoiceAgent:
         # the movement tools only when movement is actually being asked for.
         world = self.world if VISION_RE.search(text) else ""
         wants = {"move": bool(MOVE_RE.search(text)),
-                 "web": bool(LOOKUP_RE.search(text) or AGENT_RE.search(text))}
+                 "web": bool(LOOKUP_RE.search(text) or AGENT_RE.search(text)),
+                 "agent": bool(AGENT_RE.search(text))}
         # Inherit intent across a bare confirmation, so "yes, do that" can
         # actually do it.
         direct = wants["move"] or wants["web"]
