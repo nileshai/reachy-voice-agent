@@ -220,6 +220,11 @@ LOCAL_WAKE_MODEL = os.environ.get("REACHY_LOCAL_WAKE_MODEL", "tiny.en")
 
 # How long the agent keeps answering follow-ups without needing the wake word.
 CONVERSATION_WINDOW_S = 25.0
+
+# Conversation lifecycle, for an agent expected to sit in a room for days.
+HISTORY_TURNS = int(os.environ.get("REACHY_HISTORY_TURNS", 12))
+HISTORY_MAX_CHARS = int(os.environ.get("REACHY_HISTORY_MAX_CHARS", 4000))
+SESSION_RESET_S = float(os.environ.get("REACHY_SESSION_RESET", 600))
 VISION_INTERVAL_S = float(os.environ.get("REACHY_VISION_INTERVAL", 3.0))
 VISION_MAX_BACKOFF_S = float(os.environ.get("REACHY_VISION_MAX_BACKOFF", 60))
 # Captioning is background context, never in the critical path of a reply, so
@@ -367,6 +372,20 @@ SYSTEM_PROMPT = (
 # --------------------------------------------------------- NVIDIA speech (gRPC)
 
 
+def safe_to_say(text: str) -> str:
+    """Last line of defence before anything reaches the speaker.
+
+    Machine output must never be read aloud. Whatever slips through upstream
+    -- a leaked tool call, a JSON array, a bare brace -- is replaced with
+    something a person would actually say, because a robot reciting JSON is
+    worse than a robot admitting it is confused.
+    """
+    t = (text or "").strip()
+    if not t or looks_like_tool_json(t) or t.startswith(("{", "[")):
+        return "Sorry, I got tangled up there. Could you say that again?"
+    return t
+
+
 def clean_for_speech(text: str) -> str:
     """Strip anything Magpie's text normaliser will choke on.
 
@@ -383,6 +402,9 @@ def clean_for_speech(text: str) -> str:
     text = re.sub(r"\b(run_agent|web_search|move_head|turn_body|play_emotion|"
                   r"reset_pose)\b", "check", text)
     text = re.sub(r"[{}\[\]<>|\\`*_#~^]", " ", text)
+    # Emoji are read out as their names by some voices, or break the
+    # normaliser outright. They have no business in speech.
+    text = re.sub(r"[\U0001F000-\U0001FAFF\U00002600-\U000027BF️]", " ", text)
     text = re.sub(r'"([^"]*)"', r"\1", text)      # unbalanced quotes break it
     text = text.replace('"', " ").replace("'", "'")
     text = re.sub(r"\s+", " ", text).strip()
@@ -607,7 +629,17 @@ class Brain:
             # lookups outright -- "I'm not connected to live weather data" --
             # or worse, narrates a search it never ran ("(Checking weather
             # data...)"). When the request plainly needs a tool, require one.
-            body["tool_choice"] = "required" if force else "auto"
+            #
+            # Name the function rather than passing "required": asked only to
+            # call *something*, this model replied with a JSON array of four
+            # invented run_agent calls as plain text. Naming it removes the
+            # ambiguity and yields exactly one call.
+            if force and len(tools) == 1:
+                body["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tools[0]["function"]["name"]}}
+            else:
+                body["tool_choice"] = "required" if force else "auto"
         r = self.http.post("/chat/completions", json=body)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]
@@ -672,7 +704,7 @@ class Brain:
             if not calls:
                 salvaged = parse_text_tool_call(msg.get("content") or "")
                 if salvaged:
-                    calls = [salvaged]
+                    calls = salvaged
                     msg = dict(msg, content="")
             used: set[str] = set()
             if not calls:
@@ -1265,34 +1297,74 @@ SKILLS = {
 }
 
 
-def parse_text_tool_call(content: str) -> dict | None:
-    """Recover a tool call the model wrote as text rather than as a call.
+def looks_like_tool_json(text: str) -> bool:
+    """Cheap check for a tool call that leaked into spoken text."""
+    s = (text or "").strip()
+    return s.startswith(("{", "[")) and ('"name"' in s or '"function"' in s)
 
-    Returns it in the same shape as a real tool_calls entry, or None. Accepts
-    both {"name": ..., "parameters": ...} and the OpenAI-ish
-    {"function": {"name": ..., "arguments": ...}} spellings.
+
+def parse_text_tool_call(content: str) -> list[dict]:
+    """Recover tool calls the model wrote as text rather than as calls.
+
+    Returns tool_calls-shaped entries, possibly empty. Handles a single
+    object, a JSON array of them (forcing tool_choice made this model emit
+    four at once as text), and a trailing truncated element. Accepts both
+    {"name", "parameters"} and {"function": {"name", "arguments"}}.
     """
     s = (content or "").strip()
-    if not s.startswith("{") or '"name"' not in s and '"function"' not in s:
-        return None
+    if not looks_like_tool_json(s):
+        return []
+    items = None
     try:
-        d = json.loads(s)
+        items = json.loads(s)
     except json.JSONDecodeError:
-        return None
-    if not isinstance(d, dict):
-        return None
-    fn = d.get("function") if isinstance(d.get("function"), dict) else d
-    name = fn.get("name")
-    if name not in SKILLS:
-        return None
-    args = fn.get("parameters", fn.get("arguments", {}))
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except json.JSONDecodeError:
+        # Arrays get cut off by max_tokens; recover the complete elements.
+        if s.startswith("["):
+            depth = 0
+            start = None
+            found = []
+            for i, ch in enumerate(s):
+                if ch == "{":
+                    if depth == 0:
+                        start = i
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        try:
+                            found.append(json.loads(s[start:i + 1]))
+                        except json.JSONDecodeError:
+                            pass
+            items = found or None
+    if items is None:
+        return []
+    if isinstance(items, dict):
+        items = [items]
+    out = []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        fn = d.get("function") if isinstance(d.get("function"), dict) else d
+        name = fn.get("name")
+        if name not in SKILLS:
+            continue
+        args = fn.get("parameters", fn.get("arguments", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
             args = {}
-    return {"id": "salvaged", "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args or {})}}
+        # The model sometimes prefixes the task with the tool name again.
+        if isinstance(args.get("task"), str):
+            args["task"] = re.sub(r"^\s*run_agent\s*:\s*", "", args["task"])
+        out.append({"id": f"salvaged{len(out)}", "type": "function",
+                    "function": {"name": name,
+                                 "arguments": json.dumps(args)}})
+        if len(out) >= 2:      # one turn should not fan out into a batch
+            break
+    return out
 
 
 def tool_schema(move: bool = True, web: bool = True) -> list[dict]:
@@ -1485,6 +1557,7 @@ class VoiceAgent:
         self._filler: threading.Thread | None = None
         # Intent carried forward so a bare "yes" can act on the last request.
         self._pending_intent: dict | None = None
+        self._last_turn_at = 0.0
         self.local_wake: LocalWake | None = None
         if LOCAL_WAKE and not NO_WAKE:
             try:
@@ -1792,7 +1865,7 @@ class VoiceAgent:
                     spoken_until = time.time() + d
                     self.emit("reply_start", text=first,
                               first_audio_s=round(time.time() - t0, 2))
-        answer = (first + " " + buf).strip() if first else buf.strip()
+        answer = safe_to_say((first + " " + buf).strip() if first else buf.strip())
         if not answer:
             return False
         if not first:
@@ -1824,9 +1897,30 @@ class VoiceAgent:
                         lambda: self._set_state("idle")).start()
         return True
 
+    def _trim_history(self) -> None:
+        """Keep the context bounded for an agent that runs for days.
+
+        Two limits, because message count alone is not enough: a handful of
+        long lookup answers can dominate the context and push the model into
+        answering an earlier question. Also drops the whole conversation after
+        a long silence -- whoever speaks next is starting fresh, and carrying
+        yesterday's thread is how the robot ends up answering the wrong thing.
+        """
+        idle = time.time() - self._last_turn_at
+        if self._last_turn_at and idle > SESSION_RESET_S and self.history:
+            self.emit("session_reset", idle_s=round(idle))
+            self.history.clear()
+            self._pending_intent = None
+        del self.history[:-HISTORY_TURNS]
+        total = sum(len(m.get("content") or "") for m in self.history)
+        while len(self.history) > 2 and total > HISTORY_MAX_CHARS:
+            total -= len(self.history[0].get("content") or "")
+            self.history.pop(0)
+        self._last_turn_at = time.time()
+
     def _respond(self, text: str) -> None:
+        self._trim_history()
         self.history.append({"role": "user", "content": text})
-        del self.history[:-12]
         self._set_state("thinking")
         t0 = time.time()
 
@@ -1862,9 +1956,12 @@ class VoiceAgent:
         if direct:
             self._pending_intent = dict(wants)
         allow = wants if (wants["move"] or wants["web"]) else None
-        # Require a tool when the request plainly needs one. Left to its own
-        # judgement the model refuses lookups it is perfectly able to make.
-        force_tool = bool(allow and allow.get("web"))
+        # Require a tool whenever the gate matched. Left to its own judgement
+        # the model refuses lookups it could make, and -- worse -- answers
+        # "All set, back to neutral" or "I'm feeling pretty joyful" without
+        # ever moving. Claiming an action it did not take is the one failure
+        # a user cannot detect from the reply alone.
+        force_tool = bool(allow)
 
         # Tool-free conversational turns stream, so the robot starts talking
         # before the model has finished writing. That is most turns.
@@ -1885,8 +1982,7 @@ class VoiceAgent:
             self.emit("error", where="llm", detail=f"{type(e).__name__}: {e}")
             self._set_state("idle")
             return
-        if not answer:
-            answer = "Sorry, I didn't catch that."
+        answer = safe_to_say(answer)
         self.history.append({"role": "assistant", "content": answer})
         # If it just offered to look something up, arm the lookup intent: the
         # user's next line is usually a bare "yes, please do".
