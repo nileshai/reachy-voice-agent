@@ -20,15 +20,31 @@ things up on the internet.
 | On-device wake detection (faster-whisper) | working |
 | Vision — captions every 3 s into a rolling world state | working |
 | Voice movement control — head, body, 81 emotions | working |
-| Web / computer tasks via an agent CLI | working, ~27 s, off by default |
-| Web search via a search API | built, **needs an API key** |
+| Web search (Tavily) | working, **~2 s** |
+| Web / computer tasks via an agent CLI | working, ~25–45 s, opt-in |
+| Conversation soak test | `test_conversation.py` |
 | Web UI — video, audio meter, transcript, power button | working |
 | Robot power on/off from the UI | working |
 | Barge-in — talk over the robot and it stops | working |
 | Filler speech during slow lookups | working |
 
-**First sound after you stop speaking: ~1.3–1.6 s.** Lookups are the exception
-at ~25–45 s, because they shell out to an agent CLI; see §7.
+**First sound after you stop speaking: ~1.3–1.6 s.** Lookups add ~2 s via
+Tavily. Only `run_agent` (files, shell) is still slow at ~25–45 s, and it is
+no longer offered for plain lookups.
+
+Before changing anything in the conversation path, run the soak test — it
+replays scripted conversations through the real Brain and gating and asserts
+on what would have been *said*:
+
+```bash
+set -a && source .env && set +a
+.venv/bin/python test_conversation.py --quick    # ~1 min
+.venv/bin/python test_conversation.py            # includes slow lookups
+```
+
+Every bug found in live use was conversational, not a crash — JSON spoken
+aloud, a tool result ignored for an invented story, an action claimed but
+never taken. None raise an exception, so nothing else catches them.
 
 ---
 
@@ -228,18 +244,34 @@ Each of these cost real time; the fixes are in the code with comments.
   Measured mic level during the robot's own full-volume speech: max 35, below
   an empty room. But barge-in must use a *higher* gate than speech onset,
   because the robot is also moving and the mics hear the servos.
+- **A bare "hey" is ~0.4 s — exactly the old minimum-utterance cutoff**, so
+  the wake word was discarded before the detector ever ran, silently. That
+  reads as "the wake word works sometimes". The detector itself is fine: 0/9
+  missed on speech degraded to quarter volume at 8 dB SNR, and it wakes even
+  when "Hey Reachy" transcribes as "Hey, Regi". Any VAD stage that drops a
+  segment must emit an event, or the failure is invisible.
+- **Forcing a tool with `tool_choice: "required"` invites a batch.** With one
+  tool available the model replied with a JSON array of four invented calls as
+  plain text. Name the function explicitly instead, and cap calls per turn —
+  three web_searches plus a run_agent in one turn measured 45 s where a single
+  search took 2 s.
+- **Offering a fast and a slow tool together means the slow one gets used.**
+  `run_agent` (~25–45 s) is now withheld unless the request is genuinely a
+  computer task; lookups only ever see `web_search` (~2 s).
+- **Filler speech must be delayed, not immediate.** Announcing a lookup that
+  returns in 2 s makes the fast path slower and choppier. It waits 1.3 s, and
+  the opening line is canned — generating a contextual one costs an LLM
+  round-trip that a fast lookup finishes inside, so the robot ended up
+  announcing searches that had already returned.
 
 ---
 
 ## 7. Open items
 
-1. **Rotate the NVIDIA API key.** Highest priority.
-2. **Web search backend — the single biggest remaining win.** `web_search` is
-   written and wired but has no key, so every lookup falls through to the
-   agent CLI at ~25–45 s. A Tavily key takes news and weather to ~3 s and
-   makes the filler machinery unnecessary for the common case. Set
-   `TAVILY_API_KEY` and it activates automatically.
-3. **`docs/ui.png`** — the README references a screenshot that does not exist.
+1. **Rotate both API keys** (NVIDIA and Tavily). Both were exposed in a chat
+   transcript. Neither is in the repo; both live only in `.env`, so rotating
+   is a one-file edit.
+2. **`docs/ui.png`** — the README references a screenshot that does not exist.
 5. **Latency floor is ~1.3 s**: hangover 0.4 + drain 0.2 + first token 0.3 +
    TTS 0.4. Going lower needs speculative endpointing — starting the LLM on a
    partial transcript — which risks answering the wrong question.
