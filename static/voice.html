@@ -70,7 +70,8 @@
     font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
     color: var(--dim); font-weight: 600;
   }
-  .power-state[data-p="running"] { color: var(--accent); }
+  .power-state[data-p="awake"]   { color: var(--accent); }
+  .power-state[data-p="asleep"]  { color: var(--user); }
   .power-state[data-p="stopped"] { color: var(--warn); }
   .power-state[data-p="offline"] { color: var(--err); }
   .power { background: #2a2438; color: #c3b0e8; border-color: #413660; }
@@ -213,7 +214,7 @@
         <div id="gate" style="left:0%"></div>
       </div>
       <div class="audio-legend">
-        <span>level <b id="lvl">0</b></span>
+        <span>level <b id="lvl">0</b> · peak <b id="pk">0</b></span>
         <span style="color:var(--warn)">▏gate <span id="gt">0</span></span>
       </div>
     </div>
@@ -240,6 +241,7 @@
 <script>
 const $ = id => document.getElementById(id);
 let running = false, since = 0, busy = false, wakePhrase = 'hey';
+let peakHold = 0, peakAt = 0;
 
 // The meter is logarithmic: speech runs ~30x the noise floor, so a linear
 // scale would pin the bar at either end and show nothing useful.
@@ -289,7 +291,7 @@ let robotState = 'unknown', powerBusy = false;
 
 $('power').onclick = async () => {
   if (powerBusy) return;
-  const turningOn = robotState !== 'running';
+  const turningOn = robotState !== 'awake';
   // Stopping the daemon while the agent holds the camera leaves a stranded
   // gstreamer process, so stop the conversation first.
   if (!turningOn && running) {
@@ -316,18 +318,26 @@ async function pollPower() {
   try {
     const r = await fetch('/api/power/status');
     const p = await r.json();
-    robotState = p.reachable ? (p.state || 'unknown') : 'offline';
+    // Track awake/asleep, not just the daemon: a running daemon with released
+    // motors is the head-down state, and offering "shut down" for that left
+    // no way to wake the robot from here.
+    robotState = p.reachable ? (p.phase || 'unknown') : 'offline';
     $('pstate').textContent = 'robot ' + robotState;
     $('pstate').dataset.p = robotState;
     if (!powerBusy) {
-      const on = robotState === 'running';
-      $('power').textContent = on ? 'Shut down robot' : 'Wake robot';
-      $('power').classList.toggle('on', on);
+      const awake = robotState === 'awake';
+      $('power').textContent = awake ? 'Shut down robot'
+                             : robotState === 'asleep' ? 'Wake robot'
+                             : 'Start robot';
+      $('power').classList.toggle('on', awake);
       $('power').disabled = robotState === 'offline';
-      // The agent cannot start without the daemon; make that obvious rather
-      // than letting Start fail with a preflight error.
-      $('toggle').disabled = !on && !running;
-      $('toggle').title = on ? '' : 'Wake the robot first';
+      $('power').title = robotState === 'asleep'
+        ? 'Daemon is running but the motors are released — the head hangs down'
+        : '';
+      // The agent needs the daemon; say so rather than failing in preflight.
+      const usable = p.reachable && p.state === 'running';
+      $('toggle').disabled = !usable && !running;
+      $('toggle').title = usable ? '' : 'Start the robot first';
     }
   } catch (e) {
     robotState = 'offline';
@@ -411,6 +421,12 @@ async function pollStatus() {
       $('bar').classList.toggle('over', s.level >= s.gate);
       $('lvl').textContent = s.level;
       $('gt').textContent = s.gate;
+      // Peak-hold: the instantaneous level is too twitchy to judge whether
+      // your voice is actually clearing the gate.
+      if (s.level > peakHold) { peakHold = s.level; peakAt = Date.now(); }
+      else if (Date.now() - peakAt > 3000) { peakHold = s.level; }
+      $('pk').textContent = peakHold;
+      $('pk').style.color = peakHold >= s.gate ? 'var(--accent)' : 'var(--dim)';
       if (s.world) { $('cap').style.display = 'block'; $('capt').textContent = s.world; }
     }
     $('f-llm').textContent = s.llm || '—';
@@ -438,6 +454,7 @@ async function pollEvents() {
       else if (e.kind === 'unaddressed') unaddressed(e.text);
       else if (e.kind === 'ignored') sys('ignored, no wake word: "' + e.local + '"', 'ignored');
       else if (e.kind === 'empty')   sys('background noise, no speech (' + e.secs + 's)', 'ignored');
+      else if (e.kind === 'noise')   sys('noise rejected before ASR (' + e.secs + 's, level ' + e.median + ' < ' + e.needed + ')', 'ignored');
       else if (e.kind === 'error')   sys('error in ' + e.where + ': ' + e.detail, 'err');
       else if (e.kind === 'ready')   sys('ready — wake: ' + e.wake);
     }

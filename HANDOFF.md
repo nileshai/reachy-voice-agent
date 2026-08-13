@@ -1,6 +1,6 @@
 # Project handoff — Reachy Mini voice agent
 
-Everything needed to pick this up on another machine. Written 2026-08-11.
+Everything needed to pick this up on another machine. Updated 2026-08-12.
 
 Claude Code sessions do not transfer between machines, so this file replaces
 the conversation: it records what was built, what was measured, which
@@ -24,8 +24,37 @@ things up on the internet.
 | Web search via a search API | built, **needs an API key** |
 | Web UI — video, audio meter, transcript, power button | working |
 | Robot power on/off from the UI | working |
+| Barge-in — talk over the robot and it stops | working |
+| Filler speech during slow lookups | working |
 
-**First sound after you stop speaking: ~1.3–1.6 s.**
+**First sound after you stop speaking: ~1.3–1.6 s.** Lookups are the exception
+at ~25–45 s, because they shell out to an agent CLI; see §7.
+
+---
+
+## 1a. Model choices, and how they were reached
+
+Benchmarked across every chat model reachable on this account. Median / max
+seconds per streamed reply:
+
+| Model | med | max | ttft | tools |
+|---|---|---|---|---|
+| **nemotron-3-nano-30b-a3b** ← LLM default | **0.46** | 0.76 | 0.27 | yes |
+| llama-3.1-8b-instruct | 0.81 | 1.18 | 0.31 | yes |
+| gpt-oss-20b | 1.32 | 1.50 | 0.94 | yes |
+| nemotron-nano-9b-v2 | 2.62 | 2.81 | — | **no** |
+| nemotron-3.5-lightning-30b-a3b | 3.43 | 3.87 | 2.66 | yes |
+| nemotron-mini-4b | 0.39 | 0.48 | 0.21 | **no** |
+
+The default is a 30B mixture-of-experts with ~3B active parameters — also the
+right shape for a **DGX Spark**: the whole model fits in 128 GB unified memory
+while only active experts cost compute. Served locally there, the network
+round-trip leaves every turn. Note the LLM is no longer the bottleneck; with a
+zero-latency model the floor is still ~1.2 s (VAD hangover 0.4 + ASR drain 0.2
++ TTS 0.4 + upload 0.2), so moving **ASR and TTS** onto Spark matters more.
+
+Vision default is `llama-3.1-nemotron-nano-vl-8b-v1` (~1.5 s). The captioner
+rotates through fallbacks after repeated failures — see §6.
 
 ---
 
@@ -163,19 +192,54 @@ Each of these cost real time; the fixes are in the code with comments.
   about it" after a *lookup* produces "I've got the latest news for you" with
   the actual information discarded.
 - **`pgrep -f gst-launch-1.0` matches the shell running the check.** Use `-x`.
+- **A hosted VLM can be down for hours** while others answer the identical
+  payload in ~1 s. `nemotron-nano-12b-v2-vl` timed out on 6/6 calls; shrinking
+  the image changed nothing. The captioner now rotates models after repeated
+  failures and backs off instead of retrying every 3 s and flooding the log.
+- **`tool_choice: "auto"` is not enough.** nemotron-3-nano refuses lookups it
+  is perfectly able to make ("I'm not connected to live weather data") or,
+  worse, *narrates a search it never ran* — "(Checking weather data…)" — then
+  invents the result. When the request plainly needs a tool, pass
+  `tool_choice: "required"` on the first hop only.
+- **A model will ignore a good tool result and confabulate.** Asked to suggest
+  a song, the tool returned a real recommendation and the reply described a
+  fatal factory fire, borrowing details from earlier in the conversation. Two
+  causes: the post-tool instruction said "include names, numbers, what
+  happened" (which primes an incident report), and the summarising hop ran at
+  conversational temperature. Now the tool output is inlined verbatim under a
+  hard "use ONLY this" instruction, at temperature 0.15.
+- **Intent gating must not be stateless.** "Absolutely you should" carries the
+  previous turn's intent but none of its keywords, so tools were withheld at
+  exactly the moment the user agreed to a lookup — and the model roleplayed
+  `*turns head right*` instead of acting. Intent is now inherited across a
+  bare confirmation, single-use so it cannot fire a stale lookup later.
+- **An absolute VAD floor inverts in a quiet room.** With the floor at 400 and
+  ambient at ~20, speech had to be 20× the noise; normal talking peaked at 275
+  and the VAD never opened, which looks exactly like a wedged agent. Absolute
+  backstops must stay low enough that the adaptive multiplier governs.
+- **Peak energy alone triggers on transients.** A chair scrape clears the gate
+  and burns an ASR call that returns nothing. Require sustained median energy
+  across the segment before transcribing.
+- **Magpie's text normaliser dies on unbalanced braces/quotes** — Triton
+  returns "multichar start character but not an end character" and the turn is
+  lost. Sanitise before synthesis; also strip `*stage directions*` and any
+  leaked tool names.
+- **Barge-in is only possible because the XMOS board cancels the speaker.**
+  Measured mic level during the robot's own full-volume speech: max 35, below
+  an empty room. But barge-in must use a *higher* gate than speech onset,
+  because the robot is also moving and the mics hear the servos.
 
 ---
 
 ## 7. Open items
 
 1. **Rotate the NVIDIA API key.** Highest priority.
-2. **Web search backend.** `web_search` is written and wired but has no key.
-   A Tavily key drops news/weather from ~27 s (agent CLI) to ~3 s. Set
+2. **Web search backend — the single biggest remaining win.** `web_search` is
+   written and wired but has no key, so every lookup falls through to the
+   agent CLI at ~25–45 s. A Tavily key takes news and weather to ~3 s and
+   makes the filler machinery unnecessary for the common case. Set
    `TAVILY_API_KEY` and it activates automatically.
-3. **`vision ReadTimeout`** appears occasionally — the VLM captioning call
-   timing out. Harmless (the caption goes stale, the loop retries) but wants
-   retry/backoff.
-4. **`docs/ui.png`** — the README references a screenshot that does not exist.
+3. **`docs/ui.png`** — the README references a screenshot that does not exist.
 5. **Latency floor is ~1.3 s**: hangover 0.4 + drain 0.2 + first token 0.3 +
    TTS 0.4. Going lower needs speculative endpointing — starting the LLM on a
    partial transcript — which risks answering the wrong question.

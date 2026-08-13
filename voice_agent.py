@@ -70,13 +70,47 @@ FN_ASR_WHISPER = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"   # ai-whisper-large-v3
 FN_TTS_MAGPIE = "877104f7-e885-42b9-8de8-f6e4c6303969"    # ai-magpie-tts-multilingual
 FN_TTS_CHATTERBOX = "ddacc747-1269-4fab-bfd9-8f593dead106"  # ai-chatterbox-multilingual-tts
 
-# llama-3.1-8b is the default because it is the fastest model tested that
-# reliably emits tool calls. mistral-nemotron answers faster (0.41s vs 1.15s)
-# but returns `tool_calls: []` and explains itself instead of acting, so the
-# robot cannot be driven by voice with it. gpt-oss-120b nests the arguments
-# wrongly. Set REACHY_LLM=mistralai/mistral-nemotron for chat-only, no control.
-LLM_MODEL = os.environ.get("REACHY_LLM", "meta/llama-3.1-8b-instruct")
-VLM_MODEL = os.environ.get("REACHY_VLM", "nvidia/nemotron-nano-12b-v2-vl")
+# Benchmarked across every chat model on build.nvidia.com reachable from this
+# account (median / max seconds over repeated streamed replies):
+#   nemotron-3-nano-30b-a3b   0.46 / 0.76, ttft 0.27, tools OK   <- default
+#   llama-3.1-8b-instruct     0.81 / 1.18, ttft 0.31, tools OK
+#   gpt-oss-20b               1.32 / 1.50, ttft 0.94, tools OK
+#   nemotron-nano-9b-v2       2.62 / 2.81, no tool calls
+#   nemotron-3.5-lightning    3.43 / 3.87, ttft 2.66 -- best prose, too slow
+#   nemotron-mini-4b          0.39 / 0.48 but never calls tools
+#   mistral-nemotron          returns tool_calls: [] -- explains, never acts
+#   gpt-oss-120b              nests tool arguments wrongly
+#   nemotron-3-super-120b     correct calls but 25-30s per reply
+#
+# The default is a 30B mixture-of-experts with ~3B active parameters, which is
+# also the right shape for a DGX Spark: the whole model fits in 128 GB unified
+# memory while only the active experts cost compute per token. Served locally
+# there, the network round-trip disappears from every turn.
+LLM_MODEL = os.environ.get("REACHY_LLM", "nvidia/nemotron-3-nano-30b-a3b")
+
+# Nemotron reasoning models emit their chain-of-thought into `content` unless
+# thinking is switched off -- which would be spoken aloud verbatim ("Here's a
+# thinking process: 1. Analyze User Input..."). Sent only to models that
+# understand it; an unknown key is not universally ignored.
+def _no_think_kwargs(model: str) -> dict:
+    m = model.lower()
+    if "nemotron" in m and any(k in m for k in ("lightning", "3.5", "-3-", "super", "nano")):
+        return {"chat_template_kwargs": {"thinking": False}}
+    return {}
+
+
+LLM_EXTRA = _no_think_kwargs(LLM_MODEL)
+# Vision. Hosted VLMs go down without warning -- nemotron-nano-12b-v2-vl was
+# timing out on every call for hours while other VLMs answered in ~1s on the
+# identical payload -- so the captioner rotates to the next model after
+# repeated failures instead of blocking the whole vision loop.
+VLM_MODEL = os.environ.get("REACHY_VLM", "nvidia/llama-3.1-nemotron-nano-vl-8b-v1")
+VLM_FALLBACKS = [m for m in [
+    VLM_MODEL,
+    "meta/llama-3.2-11b-vision-instruct",
+    "nvidia/nemotron-nano-12b-v2-vl",
+] if m]
+VLM_FAILS_BEFORE_ROTATE = int(os.environ.get("REACHY_VLM_ROTATE_AFTER", 3))
 
 TTS_FUNCTION = FN_TTS_MAGPIE
 TTS_VOICE = "Magpie-Multilingual"
@@ -132,8 +166,18 @@ FRAME_BYTES = FRAME_SAMPLES * 2
 # working in a quieter or noisier one.
 VAD_ON_MULT = float(os.environ.get("REACHY_VAD_ON_MULT", 6.0))
 VAD_OFF_MULT = float(os.environ.get("REACHY_VAD_OFF_MULT", 3.0))
-VAD_ON_FLOOR = float(os.environ.get("REACHY_VAD_ON_FLOOR", 400))
-VAD_OFF_FLOOR = float(os.environ.get("REACHY_VAD_OFF_FLOOR", 200))
+# Absolute backstops. Kept low enough that a quiet room does not silently
+# raise the bar out of reach: measured with the room floor at ~20, a 400 gate
+# demanded speech 20x the noise level, and normal talking at a normal distance
+# peaked at 275 -- so the VAD never opened at all and the agent looked wedged.
+VAD_ON_FLOOR = float(os.environ.get("REACHY_VAD_ON_FLOOR", 220))
+VAD_OFF_FLOOR = float(os.environ.get("REACHY_VAD_OFF_FLOOR", 110))
+
+# A segment must also be sustained, not just have one loud spike. A door slam
+# or chair scrape clears the gate on peak alone; speech keeps energy up across
+# most of its frames. This is checked before calling ASR, so noise costs
+# nothing and stops filling the transcript with "no speech".
+VAD_MIN_MEDIAN_MULT = float(os.environ.get("REACHY_VAD_MEDIAN_MULT", 0.75))
 # Silence needed to close an utterance. This is dead time the user feels on
 # every single turn, so it is kept as short as endpointing allows.
 VAD_HANGOVER_S = float(os.environ.get("REACHY_VAD_HANGOVER", 0.40))
@@ -176,7 +220,11 @@ LOCAL_WAKE_MODEL = os.environ.get("REACHY_LOCAL_WAKE_MODEL", "tiny.en")
 
 # How long the agent keeps answering follow-ups without needing the wake word.
 CONVERSATION_WINDOW_S = 25.0
-VISION_INTERVAL_S = 3.0
+VISION_INTERVAL_S = float(os.environ.get("REACHY_VISION_INTERVAL", 3.0))
+VISION_MAX_BACKOFF_S = float(os.environ.get("REACHY_VISION_MAX_BACKOFF", 60))
+# Captioning is background context, never in the critical path of a reply, so
+# it should give up quickly rather than tie up a worker for 45s.
+VLM_TIMEOUT = float(os.environ.get("REACHY_VLM_TIMEOUT", 12))
 
 # A tool call may itself trigger a follow-up call ("turn right and look
 # happy"), so allow a few hops -- but cap them, or a model that keeps calling
@@ -186,6 +234,33 @@ MAX_TOOL_HOPS = int(os.environ.get("REACHY_MAX_TOOL_HOPS", 4))
 # Tools slow enough that the robot should say something before starting.
 # Transcribe concurrently with speech once a conversation is open.
 STREAM_ASR = os.environ.get("REACHY_STREAM_ASR", "1") not in ("", "0", "false")
+
+# Barge-in: talking over the robot cuts it off mid-sentence. Safe here because
+# the XMOS board cancels the speaker in hardware -- measured mic level during
+# the robot's own full-volume speech was 35, below the room floor.
+BARGE_IN = os.environ.get("REACHY_BARGE_IN", "1") not in ("", "0", "false")
+# Barge-in needs a higher bar than normal speech onset: while speaking the
+# robot is also moving, and the mics hear the servos. Measured with motion
+# running, a majority of frames cleared the ordinary gate.
+BARGE_MIN_FRAMES = int(os.environ.get("REACHY_BARGE_FRAMES", 3))   # x100 ms
+BARGE_MULT = float(os.environ.get("REACHY_BARGE_MULT", 2.5))
+BARGE_FLOOR = float(os.environ.get("REACHY_BARGE_FLOOR", 2500))
+
+# Deaf window after playback starts, covering the click of play_sound. This
+# used to span the whole clip, which is what made barge-in impossible.
+PLAY_GUARD_S = float(os.environ.get("REACHY_PLAY_GUARD", 0.35))
+
+# Spoken while a slow lookup runs. Deliberately vague about progress -- the
+# agent gives no signal, so anything specific would be a lie -- and varied,
+# because the same phrase repeated is worse than silence.
+FILLER_LINES = [
+    "Still digging, hang on.",
+    "Getting there, this one is taking a moment.",
+    "Almost have it.",
+    "Nearly done now.",
+    "Just pulling the last of it together.",
+]
+FILLER_GAP_S = float(os.environ.get("REACHY_FILLER_GAP", 1.2))
 
 SLOW_TOOLS = {"run_agent"}
 
@@ -232,6 +307,21 @@ AGENT_RE = re.compile(
     r"check my|open my|read the|list the|clean up|delete)\b"
     r"|\brun\s+(the|a|my)\b", re.I)
 
+# Short confirmations carry the previous turn's intent but contain none of its
+# keywords. Without this, "Absolutely you should" is gated as ordinary chat and
+# the model is offered no tools at the exact moment the user has just told it
+# to go ahead -- so it narrates the action instead of taking it.
+AFFIRM_RE = re.compile(
+    r"^\s*(yes|yeah|yep|yup|sure|ok|okay|please|absolutely|definitely|"
+    r"certainly|of course|go ahead|do it|please do|you should|go for it|"
+    r"sounds good|that'?s right|correct|right)\b", re.I)
+
+# A reply that offers to look something up sets up the same situation: the
+# next turn is usually a bare "yes".
+OFFERED_LOOKUP_RE = re.compile(
+    r"\b(find out|look (it|that|them)? ?up|look into|check (for|on|the)|"
+    r"search|i can try|shall i|want me to|should i)\b", re.I)
+
 VISION_RE = re.compile(
     r"\b(see|seeing|saw|look|looking|watch|view|camera|visible|describe|"
     r"front of you|around you|behind you|holding|wearing|colou?r|"
@@ -260,11 +350,43 @@ SYSTEM_PROMPT = (
     "person asks you to move, turn, look somewhere, dance or show an emotion. "
     "'Right' means the speaker's right, which is negative yaw. Afterwards "
     "mention what you did naturally, in passing -- never recite the tool "
-    "output. Never invent a tool you were not given."
+    "output. Never invent a tool you were not given.\n\n"
+    "Using your abilities:\n"
+    "- When you have a tool that can answer, USE IT. Never ask permission "
+    "first and never say you are about to; just do it and then say what you "
+    "found.\n"
+    "- Never say a tool's name out loud. The person does not know what "
+    "'run_agent' or 'web_search' means -- say 'let me check' instead.\n"
+    "- Never narrate an action in asterisks like *turns head* or *searches "
+    "the web*. You either actually did it by calling a tool, or you did not.\n"
+    "- If you do not know something current, look it up rather than "
+    "guessing or saying you are not up to date."
 )
 
 
 # --------------------------------------------------------- NVIDIA speech (gRPC)
+
+
+def clean_for_speech(text: str) -> str:
+    """Strip anything Magpie's text normaliser will choke on.
+
+    Observed failure: a leaked tool call reached TTS and Triton died with
+    "Encountered a multichar start character but not an end character",
+    killing the whole turn. Braces, brackets and stray markdown are never
+    speakable anyway, so they are removed rather than escaped.
+    """
+    text = re.sub(r"https?://\S+", " link ", text)
+    # Drop roleplay stage directions entirely rather than just unwrapping
+    # them: "*turns head right*" spoken aloud as "turns head right" is worse
+    # than saying nothing, and the robot did not actually turn.
+    text = re.sub(r"\*[^*\n]{1,80}\*", " ", text)
+    text = re.sub(r"\b(run_agent|web_search|move_head|turn_body|play_emotion|"
+                  r"reset_pose)\b", "check", text)
+    text = re.sub(r"[{}\[\]<>|\\`*_#~^]", " ", text)
+    text = re.sub(r'"([^"]*)"', r"\1", text)      # unbalanced quotes break it
+    text = text.replace('"', " ").replace("'", "'")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def loudness_boost(mono: np.ndarray) -> np.ndarray:
@@ -377,6 +499,9 @@ class Speech:
         measurably quicker (0.34s -> 0.20s).
         """
         import riva.client
+        text = clean_for_speech(text)
+        if not text:
+            return b""
         resp = self.tts.synthesize(
             text, voice_name=TTS_VOICE, language_code="en-US",
             sample_rate_hz=TTS_RATE, encoding=riva.client.AudioEncoding.LINEAR_PCM,
@@ -404,22 +529,39 @@ class Brain:
             base_url=NVIDIA_REST, timeout=45.0,
             headers={"Authorization": f"Bearer {api_key}"},
         )
+        self._vlm_idx = 0
+        self._vlm_fails = 0
 
     def caption(self, jpeg: bytes) -> str:
         import base64
         b64 = base64.b64encode(jpeg).decode()
-        r = self.http.post("/chat/completions", json={
-            "model": VLM_MODEL, "max_tokens": 70, "temperature": 0.2,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text":
-                    "Describe this scene in one short sentence: who is present, "
-                    "what they are doing, and any notable objects."},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ]}],
-        })
-        r.raise_for_status()
+        model = VLM_FALLBACKS[self._vlm_idx % len(VLM_FALLBACKS)]
+        try:
+            r = self.http.post("/chat/completions", timeout=VLM_TIMEOUT, json={
+                "model": model, "max_tokens": 70, "temperature": 0.2,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text":
+                        "Describe this scene in one short sentence: who is "
+                        "present, what they are doing, and any notable objects."},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]}],
+            })
+            r.raise_for_status()
+        except Exception:
+            self._vlm_fails += 1
+            if self._vlm_fails >= VLM_FAILS_BEFORE_ROTATE:
+                # This model is not coming back soon; move to the next one
+                # rather than timing out on every frame indefinitely.
+                self._vlm_idx += 1
+                self._vlm_fails = 0
+            raise
+        self._vlm_fails = 0
         return (r.json()["choices"][0]["message"].get("content") or "").strip()
+
+    @property
+    def vlm_model(self) -> str:
+        return VLM_FALLBACKS[self._vlm_idx % len(VLM_FALLBACKS)]
 
     def stream_reply(self, history: list[dict], world: str):
         """Yield reply text as it is generated.
@@ -437,7 +579,7 @@ class Brain:
                 "That is context, not an answer. Never repeat or paraphrase it "
                 "unless the user explicitly asks what you can see.")
         body = {"model": LLM_MODEL, "max_tokens": 160, "temperature": 0.8,
-                "stream": True,
+                "stream": True, **LLM_EXTRA,
                 "messages": [{"role": "system", "content": sys_msg}] + list(history)}
         with self.http.stream("POST", "/chat/completions", json=body) as r:
             r.raise_for_status()
@@ -455,12 +597,17 @@ class Brain:
                 if piece:
                     yield piece
 
-    def _post(self, messages: list[dict], tools: list[dict] | None) -> dict:
-        body = {"model": LLM_MODEL, "max_tokens": 200, "temperature": 0.4,
-                "messages": messages}
+    def _post(self, messages: list[dict], tools: list[dict] | None,
+              force: bool = False, temperature: float = 0.4) -> dict:
+        body = {"model": LLM_MODEL, "max_tokens": 200,
+                "temperature": temperature, **LLM_EXTRA, "messages": messages}
         if tools:
             body["tools"] = tools
-            body["tool_choice"] = "auto"
+            # "auto" leaves it to the model, and nemotron-3-nano declines
+            # lookups outright -- "I'm not connected to live weather data" --
+            # or worse, narrates a search it never ran ("(Checking weather
+            # data...)"). When the request plainly needs a tool, require one.
+            body["tool_choice"] = "required" if force else "auto"
         r = self.http.post("/chat/completions", json=body)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]
@@ -480,7 +627,8 @@ class Brain:
         return "Okay, " + ", then ".join(done) + "."
 
     def reply(self, history: list[dict], world: str, on_tool=None,
-              allow_tools: dict | None = None, on_tool_start=None) -> str:
+              allow_tools: dict | None = None, on_tool_start=None,
+              force_tool: bool = False) -> str:
         """One turn, resolving tool calls before answering.
 
         Loops because a request like "turn right and look happy" produces two
@@ -496,9 +644,15 @@ class Brain:
         tools = tool_schema(**allow_tools) if allow_tools else None
         done: list[str] = []
 
-        for _ in range(MAX_TOOL_HOPS):
+        for hop in range(MAX_TOOL_HOPS):
             try:
-                msg = self._post(msgs, tools)
+                # Only the first hop is forced; afterwards the model needs to
+                # be free to stop calling tools and actually answer. Later hops
+                # are restating a fetched fact, where creative sampling is
+                # exactly the wrong thing.
+                msg = self._post(msgs, tools,
+                                 force=(hop == 0 and force_tool),
+                                 temperature=0.4 if hop == 0 else 0.15)
             except httpx.HTTPStatusError as e:
                 # The endpoint intermittently 500s on longer tool histories.
                 # Retry once; if it still fails but tools already ran, speak
@@ -512,6 +666,14 @@ class Brain:
                         return self._confirm(done)
                     raise
             calls = msg.get("tool_calls") or []
+            # Some models emit a tool call as plain text instead of using the
+            # tool_calls field. Observed reaching the speaker verbatim as
+            # {"name": "run_agent", "parameters": {...}}, which then killed TTS.
+            if not calls:
+                salvaged = parse_text_tool_call(msg.get("content") or "")
+                if salvaged:
+                    calls = [salvaged]
+                    msg = dict(msg, content="")
             used: set[str] = set()
             if not calls:
                 # Reasoning models put prose in reasoning_content, leaving
@@ -571,14 +733,24 @@ class Brain:
             # produces "I've got the latest news for you" -- an acknowledgement
             # with the actual information thrown away.
             if used & INFO_TOOLS:
+                # Grounding, stated as a hard restriction. An earlier version
+                # asked for "names, numbers, what happened", which primed an
+                # incident-report voice: asked to suggest a song, the model
+                # ignored a perfectly good tool result and invented a fatal
+                # factory fire, borrowing details from earlier in the history.
+                latest = "\n\n".join(
+                    m["content"] for m in msgs[-len(calls):]
+                    if m.get("role") == "tool")[:2000]
                 msgs.append({"role": "system", "content":
-                             "You now have the information you looked up. Say "
-                             "what it actually says, in two or three short "
-                             "spoken sentences. Include the real facts: names, "
-                             "numbers, what happened. Never reply with just "
-                             "'I found it' or 'here is the news' -- the person "
-                             "cannot see the result, so the content must be in "
-                             "what you say. No markdown or lists."})
+                             "Answer the user's last question using ONLY the "
+                             "tool result below. Do not use anything from "
+                             "earlier in this conversation, and do not add any "
+                             "fact that is not in it. If it does not answer "
+                             "the question, say so plainly.\n\n"
+                             f"--- TOOL RESULT ---\n{latest}\n--- END ---\n\n"
+                             "Reply in two or three short spoken sentences, no "
+                             "markdown or lists. The person cannot see the "
+                             "result, so the substance must be in your words."})
             else:
                 msgs.append({"role": "system", "content":
                              "The movement is done. Now say one short, natural "
@@ -829,6 +1001,14 @@ def split_first_sentence(text: str, min_chars: int = 25) -> tuple[str, str]:
         if end >= min_chars:
             return text[:end].strip(), text[end:].strip()
     return "", text
+
+
+def stop_sound() -> None:
+    """Cut playback immediately. This is what makes barge-in possible."""
+    try:
+        httpx.post(f"{ROBOT}/api/media/stop_sound", timeout=5.0)
+    except Exception:
+        pass
 
 
 def play_wav(wav_bytes: bytes, name: str = "_reachy_voice.wav") -> float:
@@ -1085,6 +1265,36 @@ SKILLS = {
 }
 
 
+def parse_text_tool_call(content: str) -> dict | None:
+    """Recover a tool call the model wrote as text rather than as a call.
+
+    Returns it in the same shape as a real tool_calls entry, or None. Accepts
+    both {"name": ..., "parameters": ...} and the OpenAI-ish
+    {"function": {"name": ..., "arguments": ...}} spellings.
+    """
+    s = (content or "").strip()
+    if not s.startswith("{") or '"name"' not in s and '"function"' not in s:
+        return None
+    try:
+        d = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    fn = d.get("function") if isinstance(d.get("function"), dict) else d
+    name = fn.get("name")
+    if name not in SKILLS:
+        return None
+    args = fn.get("parameters", fn.get("arguments", {}))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    return {"id": "salvaged", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args or {})}}
+
+
 def tool_schema(move: bool = True, web: bool = True) -> list[dict]:
     """Only the tools the turn plausibly needs.
 
@@ -1270,6 +1480,11 @@ class VoiceAgent:
         self.state = "idle"     # idle | listening | thinking | speaking
         self._warm_at = 0.0
         self._warming = False
+        self._barge = threading.Event()
+        self._filler_stop = threading.Event()
+        self._filler: threading.Thread | None = None
+        # Intent carried forward so a bare "yes" can act on the last request.
+        self._pending_intent: dict | None = None
         self.local_wake: LocalWake | None = None
         if LOCAL_WAKE and not NO_WAKE:
             try:
@@ -1305,6 +1520,78 @@ class VoiceAgent:
 
             threading.Thread(target=go, daemon=True).start()
 
+    def _start_filler(self, question: str) -> None:
+        """Talk through a slow lookup instead of going silent.
+
+        Opens with a line generated from the actual question, so it sounds
+        like the robot engaging with what was asked rather than a canned hold
+        message, then falls back to short progress lines. Stops the moment the
+        result lands.
+        """
+        self._filler_stop.clear()
+
+        def run():
+            said = 0
+            try:
+                # Contextual opener, generated while the lookup is already in
+                # flight so it costs no extra wall-clock.
+                try:
+                    opener = self.brain.reply(
+                        [{"role": "user", "content":
+                          f"I just asked you: {question!r}. You are looking it "
+                          "up now and it takes a few seconds. Say ONE short "
+                          "spoken sentence to fill the pause -- acknowledge "
+                          "what you are checking and add a brief related "
+                          "thought. Do not answer the question itself."}],
+                        "", allow_tools=None)
+                except Exception:
+                    opener = "Let me look that up for you."
+                for line in [opener] + FILLER_LINES:
+                    if self._filler_stop.is_set():
+                        return
+                    try:
+                        wav = self.speech.synthesize(line)
+                        if not wav:
+                            continue
+                        self._set_state("speaking")
+                        dur = play_wav(wav, f"_reachy_fill_{said % 2}.wav")
+                        self._mute_until = time.time() + PLAY_GUARD_S
+                        said += 1
+                        self.emit("filler", n=said, text=line[:60])
+                    except Exception as e:
+                        self.emit("error", where="filler",
+                                  detail=f"{type(e).__name__}: {e}")
+                        return
+                    # Wait out the clip plus a natural beat, but wake early if
+                    # the answer arrives.
+                    if self._filler_stop.wait(dur + FILLER_GAP_S):
+                        return
+            finally:
+                self._set_state("thinking")
+
+        self._filler = threading.Thread(target=run, daemon=True)
+        self._filler.start()
+
+    def _stop_filler(self) -> None:
+        """Result is in: stop mid-filler and hand over to the real answer."""
+        self._filler_stop.set()
+        if self._filler and self._filler.is_alive():
+            stop_sound()
+            self._filler.join(timeout=2.0)
+        self._filler = None
+
+    def _interrupt(self) -> None:
+        """Stop talking because the user started. The point of barge-in: you
+        never have to wait out an answer you have already heard enough of."""
+        self._barge.set()
+        stop_sound()
+        # Hold the conversation open. The window is normally extended after a
+        # reply finishes playing, so interrupting one would otherwise demand
+        # the wake word again -- exactly when the user is mid-sentence.
+        self.awake_until = time.time() + CONVERSATION_WINDOW_S
+        self.emit("interrupted")
+        self._set_state("listening")
+
     def _set_state(self, state: str) -> None:
         if state != self.state:
             self.state = state
@@ -1320,8 +1607,10 @@ class VoiceAgent:
 
     # -- background vision --------------------------------------------
     def _vision_loop(self) -> None:
+        backoff = 0.0
+        streak = 0
         while self.running:
-            time.sleep(VISION_INTERVAL_S)
+            time.sleep(VISION_INTERVAL_S + backoff)
             frame = self.av.latest_frame()
             if not frame:
                 continue
@@ -1330,8 +1619,20 @@ class VoiceAgent:
                 if cap:
                     self.world, self.world_at = cap, time.time()
                     self.emit("vision", caption=cap)
+                if streak:
+                    self.emit("vision_ok", model=self.brain.vlm_model)
+                backoff, streak = 0.0, 0
             except Exception as e:
-                self.emit("error", where="vision", detail=f"{type(e).__name__}: {e}")
+                streak += 1
+                # Back off instead of hammering a dead endpoint every 3s and
+                # burying the transcript in identical errors. Report the first
+                # few, then stay quiet until it recovers.
+                backoff = min(VISION_MAX_BACKOFF_S, (backoff or 3.0) * 2)
+                if streak <= 3 or streak % 10 == 0:
+                    self.emit("error", where="vision", streak=streak,
+                              model=self.brain.vlm_model,
+                              retry_in=round(VISION_INTERVAL_S + backoff),
+                              detail=f"{type(e).__name__}")
 
     # -- utterance segmentation ---------------------------------------
     def _next_utterance(self) -> tuple[bytes, str] | None:
@@ -1343,6 +1644,7 @@ class VoiceAgent:
         """
         voiced: list[bytes] = []
         stream: StreamingASR | None = None
+        barge_frames = 0
         silence = 0.0
         recent: list[float] = []
         frames_seen = 0
@@ -1352,6 +1654,11 @@ class VoiceAgent:
                 frame = self.av.audio_q.get(timeout=1.0)
             except queue.Empty:
                 continue
+            # A short guard only, covering the click of play_sound starting.
+            # Muting for the whole clip is what previously made barge-in
+            # impossible; the XMOS board cancels the speaker so well that the
+            # mics read below the room floor while it talks (measured max 35
+            # against a floor of 30-360), so listening through playback is safe.
             if time.time() < self._mute_until:
                 voiced.clear()
                 silence = 0.0
@@ -1390,6 +1697,22 @@ class VoiceAgent:
                 recent.clear()
                 frames_seen = 0
                 next_report = time.time() + 10.0
+            # Barge-in: speech while the robot is talking cuts it off. Requires
+            # a couple of consecutive frames so a door slam does not stop it.
+            # Interrupting needs a higher bar than starting an utterance. While
+            # speaking the robot is also *moving* -- antennas flicking, head
+            # bobbing -- and the mics hear the motors. Reusing the normal gate
+            # let servo noise cut the robot off mid-sentence.
+            barge_thr = max(on_thr * BARGE_MULT, BARGE_FLOOR)
+            if BARGE_IN and self.state == "speaking" and rms >= barge_thr:
+                barge_frames += 1
+                if barge_frames >= BARGE_MIN_FRAMES:
+                    self.emit("barge", rms=round(rms), threshold=round(barge_thr))
+                    self._interrupt()
+                    barge_frames = 0
+            elif rms < barge_thr:
+                barge_frames = 0
+
             if not voiced:
                 if rms >= on_thr:
                     voiced.append(frame)
@@ -1417,6 +1740,21 @@ class VoiceAgent:
                             stream.finish(0.5)      # discard, but close the thread
                             stream = None
                         continue
+                    # Reject transient-triggered segments before spending an
+                    # ASR call on them.
+                    seg = np.frombuffer(b"".join(voiced), dtype="<i2")
+                    med = float(np.median(np.abs(
+                        seg.reshape(-1, FRAME_SAMPLES).astype(np.float32)).max(axis=1)))
+                    if med < off_thr * VAD_MIN_MEDIAN_MULT:
+                        self.emit("noise", secs=round(dur, 1), median=round(med),
+                                  needed=round(off_thr * VAD_MIN_MEDIAN_MULT))
+                        voiced.clear()
+                        silence = 0.0
+                        if stream is not None:
+                            stream.finish(0.5)
+                            stream = None
+                        self._set_state("idle")
+                        continue
                     t0 = time.time()
                     streamed = stream.finish() if stream is not None else ""
                     if stream is not None:
@@ -1438,8 +1776,11 @@ class VoiceAgent:
         to the blocking path. Clips alternate filenames because uploading over
         the file currently playing interrupts it on the robot.
         """
+        self._barge.clear()
         first, buf = "", ""
         for piece in self.brain.stream_reply(self.history, world):
+            if self._barge.is_set():
+                return True             # user cut in; abandon this reply
             buf += piece
             if not first:
                 first, rest = split_first_sentence(buf)
@@ -1458,18 +1799,26 @@ class VoiceAgent:
             return False                     # too short to split; use blocking path
 
         rest = buf.strip()
-        if rest:
+        if rest and not self._barge.is_set():
             wav = self.speech.synthesize(rest)
             # The opening clip is usually still playing, which is the point:
-            # the second half synthesises inside that window.
+            # the second half synthesises inside that window. Wait on the barge
+            # event rather than sleeping, so an interruption lands immediately
+            # instead of after the first clip finishes.
             gap = spoken_until - time.time()
             if gap > 0:
-                time.sleep(gap)
+                self._barge.wait(gap)
+            if self._barge.is_set():
+                return True
             spoken_until = time.time() + play_wav(wav, "_reachy_voice_b.wav")
 
         self.history.append({"role": "assistant", "content": answer})
+        # If it just offered to look something up, arm the lookup intent: the
+        # user's next line is usually a bare "yes, please do".
+        if OFFERED_LOOKUP_RE.search(answer):
+            self._pending_intent = {"move": False, "web": True}
         self.emit("reply", text=answer, llm_s=round(time.time() - t0, 2))
-        self._mute_until = spoken_until + 0.3
+        self._mute_until = time.time() + PLAY_GUARD_S
         self.awake_until = self._mute_until + CONVERSATION_WINDOW_S
         threading.Timer(max(0.0, spoken_until - time.time()),
                         lambda: self._set_state("idle")).start()
@@ -1485,24 +1834,37 @@ class VoiceAgent:
             self.emit("tool", name=name, args=args, result=str(result)[:120])
 
         def on_tool_start(name):
-            # run_agent takes ~16s. Say something first, or the robot appears
-            # to have crashed for the length of a short phone call.
+            # A lookup takes ~27s. One line then silence reads as a crash, so
+            # keep talking until the result arrives.
             if name in SLOW_TOOLS:
                 self.emit("working", tool=name)
-                try:
-                    self._set_state("thinking")
-                    wav = self.speech.synthesize(
-                        "Let me look that up, one moment.")
-                    self._mute_until = time.time() + play_wav(wav) + 0.2
-                except Exception:
-                    pass
+                self._start_filler(text)
+
+        def on_tool_done(name, args, result):
+            if name in SLOW_TOOLS:
+                self._stop_filler()
+            on_tool(name, args, result)
 
         # Supply the camera caption only when the question is about vision, and
         # the movement tools only when movement is actually being asked for.
         world = self.world if VISION_RE.search(text) else ""
         wants = {"move": bool(MOVE_RE.search(text)),
                  "web": bool(LOOKUP_RE.search(text) or AGENT_RE.search(text))}
+        # Inherit intent across a bare confirmation, so "yes, do that" can
+        # actually do it.
+        direct = wants["move"] or wants["web"]
+        if not direct and AFFIRM_RE.search(text) and self._pending_intent:
+            wants = dict(self._pending_intent)
+            # Single use. Left standing, a stale intent makes every later
+            # "okay" re-trigger a lookup from a conversation two turns ago.
+            self._pending_intent = None
+            self.emit("intent", inherited=True, **wants)
+        if direct:
+            self._pending_intent = dict(wants)
         allow = wants if (wants["move"] or wants["web"]) else None
+        # Require a tool when the request plainly needs one. Left to its own
+        # judgement the model refuses lookups it is perfectly able to make.
+        force_tool = bool(allow and allow.get("web"))
 
         # Tool-free conversational turns stream, so the robot starts talking
         # before the model has finished writing. That is most turns.
@@ -1515,9 +1877,10 @@ class VoiceAgent:
                 # fall through to the non-streaming path below
 
         try:
-            answer = self.brain.reply(self.history, world, on_tool=on_tool,
+            answer = self.brain.reply(self.history, world, on_tool=on_tool_done,
                                       allow_tools=allow,
-                                      on_tool_start=on_tool_start)
+                                      on_tool_start=on_tool_start,
+                                      force_tool=force_tool)
         except Exception as e:
             self.emit("error", where="llm", detail=f"{type(e).__name__}: {e}")
             self._set_state("idle")
@@ -1525,6 +1888,10 @@ class VoiceAgent:
         if not answer:
             answer = "Sorry, I didn't catch that."
         self.history.append({"role": "assistant", "content": answer})
+        # If it just offered to look something up, arm the lookup intent: the
+        # user's next line is usually a bare "yes, please do".
+        if OFFERED_LOOKUP_RE.search(answer):
+            self._pending_intent = {"move": False, "web": True}
         self.emit("reply", text=answer, llm_s=round(time.time() - t0, 2))
         try:
             wav = self.speech.synthesize(answer)
@@ -1532,8 +1899,8 @@ class VoiceAgent:
             dur = play_wav(wav)
             # The XMOS board does hardware AEC so the robot will not hear
             # itself, but muting keeps our own VAD from chasing the tail.
-            self._mute_until = time.time() + dur + 0.3
-            self.awake_until = self._mute_until + CONVERSATION_WINDOW_S
+            self._mute_until = time.time() + PLAY_GUARD_S
+            self.awake_until = time.time() + dur + CONVERSATION_WINDOW_S
             # Keep the talking animation running for the length of the audio,
             # then settle. play_sound returns as soon as playback starts.
             threading.Timer(dur, lambda: self._set_state("idle")).start()
@@ -1620,8 +1987,8 @@ class VoiceAgent:
                     self.awake_until = time.time() + CONVERSATION_WINDOW_S
                     play_emotion("attentive1")
                     try:
-                        self._mute_until = time.time() + play_wav(
-                            self.speech.synthesize("Yes?")) + 0.3
+                        play_wav(self.speech.synthesize("Yes?"))
+                        self._mute_until = time.time() + PLAY_GUARD_S
                     except Exception:
                         pass
                     continue

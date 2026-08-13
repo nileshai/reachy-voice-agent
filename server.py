@@ -754,12 +754,21 @@ async def diagnostics():
 
 @app.get("/api/power/status")
 async def power_status():
-    out = {"reachable": False, "state": "unknown", "motors": None, "busy": False}
+    out = {"reachable": False, "state": "unknown", "motors": None,
+           "awake": False, "phase": "offline", "busy": False}
     try:
         d = await robot_get("/api/daemon/status")
         out["reachable"] = True
         out["state"] = d.get("state", "unknown")
         out["motors"] = (d.get("backend_status") or {}).get("motor_control_mode")
+        out["awake"] = out["motors"] == "enabled"
+        # A running daemon with released motors is the head-down state: the
+        # robot looks switched off but the daemon is fine. Tracking only the
+        # daemon left the UI offering "shut down" to a robot already limp,
+        # with no way to wake it.
+        out["phase"] = ("awake" if out["awake"]
+                        else "asleep" if out["state"] == "running"
+                        else out["state"])
     except Exception as e:
         out["error"] = f"{type(e).__name__}"
     return out
