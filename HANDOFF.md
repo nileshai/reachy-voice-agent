@@ -1,6 +1,6 @@
 # Project handoff — Reachy Mini voice agent
 
-Everything needed to pick this up on another machine. Updated 2026-08-12.
+Everything needed to pick this up on another machine. Updated 2026-08-15.
 
 Claude Code sessions do not transfer between machines, so this file replaces
 the conversation: it records what was built, what was measured, which
@@ -10,15 +10,16 @@ approaches were tried and rejected, and what is still open.
 
 ## 1. Current state
 
-Working and merged to `main` (`39fe49d`). The robot holds a spoken
+Working on `main` (`c7da4b5`). The robot holds a spoken
 conversation, can be driven by voice, sees through its camera, and can look
 things up on the internet.
 
 | Capability | State |
 |---|---|
-| Wake-word conversation ("hey") | working |
+| Wake-word conversation ("hi", configurable) | working |
 | On-device wake detection (faster-whisper) | working |
-| Vision — captions every 3 s into a rolling world state | working |
+| Vision — rolling captions, plus question-aware looks | working |
+| Location memory — asks which city, remembers it | working |
 | Voice movement control — head, body, 81 emotions | working |
 | Web search (Tavily) | working, **~2 s** |
 | Web / computer tasks via an agent CLI | working, ~25–45 s, opt-in |
@@ -83,14 +84,16 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 brew install gstreamer libnice-gstreamer      # or apt, see README
 
-cp .env.example .env && $EDITOR .env          # NVIDIA_API_KEY, REACHY_IP
+cp .env.example .env && $EDITOR .env   # NVIDIA_API_KEY, TAVILY_API_KEY, REACHY_IP
 set -a && source .env && set +a
 .venv/bin/uvicorn server:app --port 7788
 ```
 
 Then open <http://localhost:7788/voice.html> and press **Start conversation**.
 
-**The API key is not in this repo and must be carried separately.** Get one at
+**Two keys are needed and neither is in this repo.** `NVIDIA_API_KEY` for the
+LLM, vision, ASR and TTS; `TAVILY_API_KEY` for search. Without the Tavily key
+lookups fall through to the agent CLI at ~25-45 s instead of ~2 s. Get one at
 [build.nvidia.com](https://build.nvidia.com). The key used during development
 was exposed in a chat transcript and should be treated as compromised —
 rotate it rather than reusing it.
@@ -128,7 +131,9 @@ must be drained; leaving one unlinked kills the pipeline in ~0.5 s with
 
 **Intent gating decides what the model is offered.** Three regexes route each
 utterance: `MOVE_RE` (movement tools), `LOOKUP_RE`/`AGENT_RE` (search tools),
-`VISION_RE` (camera caption). Nothing is offered unless matched. This exists
+`VISION_RE` (a question-aware look at the camera). Nothing is offered unless
+matched, and `LOCATION_RE` additionally forces a "which city?" question when
+a weather-style query has no place to anchor to. This exists
 because a small model reaches for whatever is in front of it — see §5.
 
 **Speech and vision run on separate clocks.** Vision captions run on their own
@@ -153,6 +158,36 @@ Not estimates — all measured against this robot and this account.
 
 Room acoustics here: silence ≈ 30 rms per 100 ms frame, speech 400–13000.
 VAD thresholds are multiples of a rolling p20 noise floor, not constants.
+
+---
+
+## 4a. How a vision question is answered
+
+Two distinct paths, and confusing them wastes an afternoon:
+
+- **Rolling caption** — every 3 s the VLM captions a frame with a *fixed
+  generic prompt*. That sentence is the robot's ambient awareness and is what
+  the LLM sees as context.
+- **Question-aware look** — when the utterance matches `VISION_RE`, the user's
+  actual question and the actual frame go to the VLM together.
+
+The second exists because the first cannot answer anything the generic caption
+did not happen to mention. "What colour is my shirt?" against "A man wearing
+glasses is sitting in a chair" is unanswerable, and the model guesses. The look
+costs ~1.5 s and runs on vision turns only; it falls back to the caption if it
+fails, so a flaky VLM degrades rather than breaking the turn.
+
+## 4b. How much conversation the model sees
+
+Not all of it. Three limits, whichever bites first:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `REACHY_HISTORY_TURNS` | 12 **messages** | last 6 exchanges (the name is misleading) |
+| `REACHY_HISTORY_MAX_CHARS` | 4000 | oldest dropped first; a couple of long lookup answers can cut this to 2-3 exchanges |
+| `REACHY_SESSION_RESET` | 600 s idle | history wiped entirely |
+
+Everything retained is sent in full on every call.
 
 ---
 
@@ -258,6 +293,25 @@ Each of these cost real time; the fixes are in the code with comments.
 - **Offering a fast and a slow tool together means the slow one gets used.**
   `run_agent` (~25–45 s) is now withheld unless the request is genuinely a
   computer task; lookups only ever see `web_search` (~2 s).
+- **A watchdog can be the outage.** The one added to restart a dead capture
+  pipeline had no backoff and judged health before WebRTC could finish
+  negotiating, so a robot that had just woken always failed the check. It then
+  restarted, racing a new peer against the one being torn down. gst logged
+  `No route to host` -- peer churn, not a network fault; gst run by hand worked
+  throughout. One transient failure became **46 restarts**. Any supervisor
+  needs a startup grace period and escalating backoff.
+- **Start and stop conditions must mirror exactly.** Filler speech started on
+  any info tool but stopped only on the slow one, so a Tavily search armed it
+  and nothing disarmed it -- the robot recited "still digging" long after
+  answering. Wrap the turn in `finally` as well.
+- **Not everything said after a question is an answer to it.** Asked "which
+  city?", a user may say "never mind" -- stored blindly, that becomes the
+  remembered home town and every later forecast is fetched for a place that
+  does not exist. Validate on length, word count, punctuation and a
+  non-answer list.
+- **A single-syllable wake word lands on the minimum-utterance cutoff.** "hi"
+  is ~0.4 s. It also gets transcribed as "high", which must be accepted --
+  but only utterance-initially, or "high priority" wakes the robot.
 - **Filler speech must be delayed, not immediate.** Announcing a lookup that
   returns in 2 s makes the fast path slower and choppier. It waits 1.3 s, and
   the opening line is canned — generating a contextual one costs an LLM
