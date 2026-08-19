@@ -54,6 +54,8 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from teacher import Teacher
+
 # ------------------------------------------------------------------- config
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
@@ -288,6 +290,22 @@ VLM_TIMEOUT = float(os.environ.get("REACHY_VLM_TIMEOUT", 12))
 MAX_TOOL_HOPS = int(os.environ.get("REACHY_MAX_TOOL_HOPS", 3))
 # One lookup answers one question; batching several is pure latency.
 MAX_CALLS_PER_TURN = int(os.environ.get("REACHY_MAX_CALLS", 1))
+
+# Spoken controls, handled before the model sees the turn. These are commands
+# rather than questions -- routing "say that again" through the LLM would get
+# a paraphrase instead of a replay.
+LESSON_CMD = [
+    ("again", re.compile(r"\b(say (that )?again|repeat( that)?|come again|"
+                         r"once more|play (that|it) again)\b", re.I)),
+    ("back",  re.compile(r"\b(go back|previous|back up|rewind)\b", re.I)),
+    ("skip",  re.compile(r"\b(skip|next|move on|carry on to the next)\b", re.I)),
+    ("resume", re.compile(r"\b(continue|resume|carry on|keep going|go on|"
+                          r"go ahead)\b", re.I)),
+    ("stop",  re.compile(r"\b(stop (reading|the lesson|it)|that'?s enough|"
+                         r"end the lesson|stop teaching)\b", re.I)),
+]
+SUMMARY_RE = re.compile(
+    r"\b(summar\w+|recap|what have (we|you) covered|so far)\b", re.I)
 
 # Tools slow enough that the robot should say something before starting.
 # Transcribe concurrently with speech once a conversation is open.
@@ -732,7 +750,7 @@ class Brain:
 
     def reply(self, history: list[dict], world: str, on_tool=None,
               allow_tools: dict | None = None, on_tool_start=None,
-              force_tool: bool = False) -> str:
+              force_tool: bool = False, lesson: str = "") -> str:
         """One turn, resolving tool calls before answering.
 
         Loops because a request like "turn right and look happy" produces two
@@ -744,6 +762,14 @@ class Brain:
                 f"\n\nCAMERA (background awareness only): {world}\n"
                 "That is context, not an answer. Never repeat or paraphrase it "
                 "unless the user explicitly asks what you can see.")
+        if lesson:
+            sys_msg += (
+                "\n\nYou are reading material aloud and the listener has just "
+                "interrupted with a question. This is the passage they were "
+                "hearing:\n---\n" + lesson + "\n---\n"
+                "Answer from this passage where you can. If the answer is not "
+                "in it, say so briefly and then answer from what you know or "
+                "look it up. Keep it short -- they are waiting to carry on.")
         msgs = [{"role": "system", "content": sys_msg}] + list(history)
         tools = tool_schema(**allow_tools) if allow_tools else None
         done: list[str] = []
@@ -1663,6 +1689,9 @@ class VoiceAgent:
         # ~30 s of frame energies, used to estimate the room noise floor
         self.noise: deque[float] = deque(maxlen=300)
         self.motion = Motion()
+        self.teacher = Teacher(
+            speech=self.speech, play=play_wav, stop_sound=stop_sound,
+            emit=self.emit, set_state=self._set_state)
         self.level = 0.0        # latest frame rms, for the GUI meter
         self.gate = 0.0         # current VAD open threshold
         self.state = "idle"     # idle | listening | thinking | speaking
@@ -1806,11 +1835,24 @@ class VoiceAgent:
             self._filler.join(timeout=2.0)
         self._filler = None
 
+    def _after_answer(self) -> None:
+        """Called once the reply has finished playing."""
+        self._set_state("idle")
+        # Auto-resume: replay the segment that was interrupted, so the
+        # listener does not lose the sentence they talked over.
+        if self.teacher.active:
+            self.teacher.resume()
+
     def _interrupt(self) -> None:
         """Stop talking because the user started. The point of barge-in: you
         never have to wait out an answer you have already heard enough of."""
         self._barge.set()
         stop_sound()
+        # A lesson is paused rather than abandoned: the listener asking a
+        # question is the point of the thing, not an interruption to recover
+        # from. Position is untouched so the segment replays.
+        if self.teacher.active:
+            self.teacher.pause()
         # Hold the conversation open. The window is normally extended after a
         # reply finishes playing, so interrupting one would otherwise demand
         # the wake word again -- exactly when the user is mid-sentence.
@@ -2050,7 +2092,7 @@ class VoiceAgent:
         self._mute_until = time.time() + PLAY_GUARD_S
         self.awake_until = self._mute_until + CONVERSATION_WINDOW_S
         threading.Timer(max(0.0, spoken_until - time.time()),
-                        lambda: self._set_state("idle")).start()
+                        self._after_answer).start()
         return True
 
     def _load_state(self) -> None:
@@ -2151,7 +2193,32 @@ class VoiceAgent:
             self.history.pop(0)
         self._last_turn_at = time.time()
 
+    def _lesson_command(self, text: str) -> bool:
+        """Handle spoken lesson controls. True means the turn is done."""
+        if not self.teacher.active and not self.teacher.segments:
+            return False
+        for name, rx in LESSON_CMD:
+            if not rx.search(text):
+                continue
+            self.emit("lesson_command", cmd=name)
+            if name == "stop":
+                self.teacher.stop()
+                self._speak_now("Alright, stopping there.")
+            elif name == "again":
+                self.teacher.again()
+            elif name == "back":
+                self.teacher.back()
+            elif name == "skip":
+                self.teacher.skip()
+            elif name == "resume":
+                self.teacher.resume()
+            return True
+        return False
+
     def _respond(self, text: str) -> None:
+        # Spoken lesson controls are commands, not questions.
+        if self._lesson_command(text):
+            return
         # Location-dependent questions need a city before anything else.
         text, handled = self._resolve_location(text)
         if handled:
@@ -2184,6 +2251,10 @@ class VoiceAgent:
 
         # Supply the camera caption only when the question is about vision, and
         # the movement tools only when movement is actually being asked for.
+        lesson_ctx = ""
+        if self.teacher.segments or self.teacher.audio:
+            lesson_ctx = (self.teacher.so_far()[-3000:]
+                          if SUMMARY_RE.search(text) else self.teacher.context())
         world = ""
         if VISION_RE.search(text):
             # Put the actual question in front of the actual pixels. Falls back
@@ -2240,7 +2311,8 @@ class VoiceAgent:
                                           on_tool=on_tool_done,
                                           allow_tools=allow,
                                           on_tool_start=on_tool_start,
-                                          force_tool=force_tool)
+                                          force_tool=force_tool,
+                                          lesson=lesson_ctx)
             finally:
                 # Whatever happened -- success, exception, an unexpected tool
                 # name -- the filler stops with the turn. It is a background
@@ -2267,7 +2339,7 @@ class VoiceAgent:
             self.awake_until = time.time() + dur + CONVERSATION_WINDOW_S
             # Keep the talking animation running for the length of the audio,
             # then settle. play_sound returns as soon as playback starts.
-            threading.Timer(dur, lambda: self._set_state("idle")).start()
+            threading.Timer(dur, self._after_answer).start()
         except Exception as e:
             self.emit("error", where="tts", detail=f"{type(e).__name__}: {e}")
             self._set_state("idle")
@@ -2417,6 +2489,70 @@ async def voice_wake():
     return {"status": "awake", "seconds": CONVERSATION_WINDOW_S}
 
 
+class LessonReq(BaseModel):
+    source: str = ""          # youtube url, web url, file path, or raw text
+    title: str = ""
+    minutes: float = 30.0     # cap on how much of a long video to take
+
+
+@router.post("/lesson/load")
+async def lesson_load(req: LessonReq):
+    """Ingest a source and start reading it.
+
+    One entry point for every kind of material: whatever is passed is
+    classified and reduced to segments, so the player never needs to know
+    where it came from.
+    """
+    if not _agent or not _agent.running:
+        return JSONResponse({"error": "agent not running"}, 409)
+    src = (req.source or "").strip() or DEMO_LESSON
+    import content
+    work = Path(tempfile.mkdtemp(prefix="reachy_lesson_"))
+    try:
+        mat = await asyncio.to_thread(content.load, src, work, req.minutes)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {str(e)[:200]}"}, 400)
+    if not len(mat):
+        return JSONResponse({"error": "nothing readable in that source"}, 400)
+    if req.title:
+        mat.title = req.title
+    n = _agent.teacher.load_material(mat)
+    # Questions during a lesson should not need the wake word.
+    _agent.awake_until = time.time() + 6 * 3600
+    _agent.teacher.start()
+    return {"status": "reading", "segments": n, "title": mat.title,
+            "kind": mat.kind, "source": mat.source[:120]}
+
+
+@router.post("/lesson/command/{what}")
+async def lesson_command(what: str):
+    """again | back | skip | pause | resume"""
+    if not _agent or not _agent.teacher.segments and not _agent.teacher.audio:
+        return JSONResponse({"error": "no lesson loaded"}, 409)
+    t = _agent.teacher
+    {"again": t.again, "back": t.back, "skip": t.skip,
+     "pause": t.pause, "resume": t.resume}.get(what, lambda: None)()
+    return {"status": what, "progress": t.progress}
+
+
+@router.post("/lesson/stop")
+async def lesson_stop():
+    if _agent:
+        _agent.teacher.stop()
+    return {"status": "stopped"}
+
+
+@router.get("/lesson/status")
+async def lesson_status():
+    if not _agent or not (_agent.teacher.segments or _agent.teacher.audio):
+        return {"active": False}
+    t = _agent.teacher
+    now = t.segments[t.pos][:150] if t.pos < len(t.segments) else ""
+    return {"active": t.active, "title": t.title, "progress": t.progress,
+            "paused": t._paused.is_set(), "kind": "audio" if t.audio else "text",
+            "now": now}
+
+
 @router.get("/status")
 async def voice_status():
     if not _agent:
@@ -2552,3 +2688,19 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# A passage with enough structure to ask real questions about, for phase 0.
+DEMO_LESSON = (
+    "Photosynthesis is the process plants use to make their own food. "
+    "Plants take in carbon dioxide from the air through tiny pores called "
+    "stomata, and draw water up from the soil through their roots. "
+    "Inside the leaves, a green pigment called chlorophyll captures energy "
+    "from sunlight. That energy splits the water molecules apart, releasing "
+    "oxygen as a by-product. The plant then combines the hydrogen with carbon "
+    "dioxide to build glucose, a simple sugar. "
+    "This is why forests are often described as the lungs of the planet: the "
+    "oxygen we breathe is essentially a waste product of plants feeding "
+    "themselves. Roughly half the world's oxygen, though, comes not from "
+    "forests but from phytoplankton drifting in the oceans."
+)

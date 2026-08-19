@@ -66,6 +66,13 @@
     background: transparent; color: var(--dim); border-color: var(--line);
   }
   .ghost:hover { color: var(--text); border-color: #37423c; }
+  .modes { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .mode {
+    border: 0; border-radius: 0; padding: 7px 15px; font-size: 12.5px;
+    background: transparent; color: var(--dim);
+  }
+  .mode:hover { color: var(--text); }
+  .mode.on { background: var(--accent); color: #0b0e0c; }
   .power-state {
     font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
     color: var(--dim); font-weight: 600;
@@ -134,6 +141,31 @@
     font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums;
   }
 
+  /* ---- teach ---- */
+  .teach { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .teach label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+                 color: var(--dim); font-weight: 600; display: block; margin-bottom: 6px; }
+  .teach input[type=text], .teach input:not([type]) {
+    width: 100%; padding: 9px 11px; border-radius: 7px; background: #0a0d0b;
+    border: 1px solid var(--line); color: var(--text); font: inherit;
+  }
+  .teach input:focus { outline: none; border-color: var(--accent-dim); }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .row .spacer { flex: 1; }
+  #t-load { background: var(--accent); color: #0b0e0c; }
+  .now { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .t-title { font-size: 12px; color: var(--dim); margin-bottom: 6px; }
+  .t-title b { color: var(--text); }
+  #t-text {
+    background: var(--panel-2); border-left: 2px solid var(--accent);
+    padding: 9px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.5;
+  }
+  .controls button { padding: 6px 12px; font-size: 12px; }
+  .hint { font-size: 11.5px; color: var(--dim); margin-top: 9px; line-height: 1.5; }
+  .hint kbd { background: #1f2a1a; border: 1px solid #34452a; border-radius: 3px;
+              padding: 1px 5px; color: var(--accent); font-size: 11px; }
+  .tlog { flex: 1; overflow-y: auto; padding: 12px 16px; min-height: 0; }
+
   /* ---- transcript ---- */
   #log { flex: 1; overflow-y: auto; padding: 14px 16px; min-height: 0; }
   .msg { margin-bottom: 14px; animation: in .25s ease; }
@@ -193,6 +225,10 @@
   <h1><span class="dot" id="dot"></span> Reachy Voice Assistant</h1>
   <span class="state" id="state" data-s="off">off</span>
   <div class="spacer"></div>
+  <div class="modes">
+    <button class="mode on" id="mode-talk" data-mode="talk">Conversation</button>
+    <button class="mode" id="mode-teach" data-mode="teach">Teach</button>
+  </div>
   <span class="power-state" id="pstate" data-p="unknown">robot ?</span>
   <button class="ghost" id="clear">Clear</button>
   <button class="power" id="power">Wake robot</button>
@@ -220,7 +256,40 @@
     </div>
   </section>
 
-  <section>
+  <section id="teach-panel" style="display:none">
+    <div class="head">Teach <span id="t-kind" style="color:#4a554e"></span></div>
+    <div class="teach">
+      <label>Source</label>
+      <input id="t-src" placeholder="YouTube URL, web page, file path, or paste text">
+      <div class="row">
+        <button class="ghost" id="t-demo">Use sample</button>
+        <button class="ghost" id="t-file">Pick file…</button>
+        <input id="t-file-input" type="file" style="display:none">
+        <span class="spacer"></span>
+        <button id="t-load">Start reading</button>
+      </div>
+      <div id="t-now" class="now" style="display:none">
+        <div class="t-title"><b id="t-title"></b> <span id="t-prog"></span></div>
+        <div id="t-text"></div>
+        <div class="row controls">
+          <button class="ghost" data-cmd="back">◀ Back</button>
+          <button class="ghost" data-cmd="again">Again</button>
+          <button class="ghost" id="t-pause" data-cmd="pause">Pause</button>
+          <button class="ghost" data-cmd="skip">Skip ▶</button>
+          <span class="spacer"></span>
+          <button class="ghost" id="t-stop">Stop</button>
+        </div>
+        <div class="hint">
+          Just talk to ask a question — it pauses, answers, and replays the
+          part you interrupted. Or say <kbd>again</kbd>, <kbd>go back</kbd>,
+          <kbd>skip</kbd>, <kbd>continue</kbd>.
+        </div>
+      </div>
+    </div>
+    <div id="t-log" class="tlog"></div>
+  </section>
+
+  <section id="talk-panel">
     <div class="head">Transcript</div>
     <div id="log">
       <div class="empty-state" id="es">
@@ -463,6 +532,14 @@ async function pollEvents() {
       else if (e.kind === 'reply')   msg('Reachy', e.text, 'llm ' + e.llm_s + 's');
       else if (e.kind === 'wake')    sys('wake detected locally: "' + e.local + '" (' + e.took + 's)', 'wake');
       else if (e.kind === 'location') sys(e.city ? ('location: ' + e.city + ' (' + e.source + ')') : 'asking which city…', 'wake');
+      else if (e.kind === 'lesson_start')   tlog('started: ' + e.title + ' (' + e.segments + ' segments)', 'wake');
+      else if (e.kind === 'lesson_segment') tlog(e.n + '/' + e.of + '  ' + e.text);
+      else if (e.kind === 'lesson_pause')   tlog('paused for your question', 'wake');
+      else if (e.kind === 'lesson_resume')  tlog('resuming — replaying that part', 'wake');
+      else if (e.kind === 'lesson_seek')    tlog('jumped to ' + e.to + '/' + e.of, 'wake');
+      else if (e.kind === 'lesson_command') tlog('command: ' + e.cmd, 'wake');
+      else if (e.kind === 'lesson_transcribed') tlog('transcribed this part: ' + e.text, 'ignored');
+      else if (e.kind === 'lesson_done')    tlog('finished: ' + e.title, 'wake');
       else if (e.kind === 'looked')  sys('looked at the camera (' + e.took + 's): ' + e.saw, 'wake');
       else if (e.kind === 'working') sys('looking that up…' + (e.tool === 'run_agent' ? ' (agent — this one is slow)' : ''), 'wake');
       else if (e.kind === 'filler')  sys('…' + e.text, 'ignored');
@@ -478,6 +555,94 @@ async function pollEvents() {
     }
   } catch (e) { /* ignore */ }
 }
+
+// ---------------- teach mode ----------------
+// Mutually exclusive with conversation: a lesson holds the speaker, and
+// having both talking would be incoherent.
+let mode = 'talk';
+function setMode(m) {
+  mode = m;
+  $('mode-talk').classList.toggle('on', m === 'talk');
+  $('mode-teach').classList.toggle('on', m === 'teach');
+  $('talk-panel').style.display  = m === 'talk'  ? 'flex' : 'none';
+  $('teach-panel').style.display = m === 'teach' ? 'flex' : 'none';
+  if (m === 'talk') stopLesson(true);
+}
+$('mode-talk').onclick  = () => setMode('talk');
+$('mode-teach').onclick = () => setMode('teach');
+
+function tlog(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'sys ' + (cls || '');
+  d.textContent = text;
+  const l = $('t-log');
+  const stick = l.scrollHeight - l.scrollTop - l.clientHeight < 60;
+  l.appendChild(d);
+  if (stick) l.scrollTop = l.scrollHeight;
+}
+
+$('t-demo').onclick = () => { $('t-src').value = ''; loadLesson(); };
+$('t-file').onclick = () => $('t-file-input').click();
+$('t-file-input').onchange = e => {
+  const f = e.target.files[0];
+  // Browsers hide the real path, so the name is a prompt not a path.
+  if (f) { $('t-src').value = f.name; tlog('picked ' + f.name +
+    ' — if it is not in the app folder, paste the full path instead'); }
+};
+$('t-load').onclick = loadLesson;
+$('t-stop').onclick = () => stopLesson(false);
+
+async function loadLesson() {
+  const src = $('t-src').value.trim();
+  $('t-load').disabled = true;
+  $('t-load').textContent = 'Loading…';
+  tlog('loading ' + (src ? src.slice(0, 70) : 'the sample passage') + ' …');
+  try {
+    const r = await fetch('/api/voice/lesson/load', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: src })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    tlog('reading "' + d.title + '" — ' + d.segments + ' segments, ' + d.kind, 'wake');
+    $('t-now').style.display = 'block';
+    $('t-kind').textContent = d.kind === 'audio' ? 'original audio' : 'read aloud';
+  } catch (e) { tlog('could not load: ' + e.message, 'err'); }
+  $('t-load').disabled = false;
+  $('t-load').textContent = 'Start reading';
+}
+
+async function stopLesson(quiet) {
+  try { await fetch('/api/voice/lesson/stop', { method: 'POST' }); } catch (e) {}
+  if (!quiet) tlog('stopped');
+  $('t-now').style.display = 'none';
+}
+
+document.querySelectorAll('[data-cmd]').forEach(b => {
+  b.onclick = async () => {
+    const cmd = b.dataset.cmd === 'pause' && b.textContent.trim() === 'Resume'
+      ? 'resume' : b.dataset.cmd;
+    try {
+      const r = await fetch('/api/voice/lesson/command/' + cmd, { method: 'POST' });
+      const d = await r.json();
+      if (d.progress) $('t-prog').textContent = d.progress;
+    } catch (e) { tlog('command failed', 'err'); }
+  };
+});
+
+async function pollLesson() {
+  if (mode !== 'teach') return;
+  try {
+    const d = await (await fetch('/api/voice/lesson/status')).json();
+    if (!d.active && !d.title) return;
+    $('t-title').textContent = d.title || '';
+    $('t-prog').textContent  = d.progress ? '· ' + d.progress : '';
+    $('t-text').textContent  = d.now || (d.kind === 'audio' ? '(playing audio)' : '');
+    $('t-pause').textContent = d.paused ? 'Resume' : 'Pause';
+    if (d.active) $('t-now').style.display = 'block';
+  } catch (e) {}
+}
+setInterval(pollLesson, 1200);
 
 setInterval(pollStatus, 450);
 setInterval(pollEvents, 700);
