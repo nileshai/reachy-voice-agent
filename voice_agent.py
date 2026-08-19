@@ -196,8 +196,14 @@ VAD_MAX_UTTERANCE_S = 15.0
 #
 # Variants exist because ASR does not render these cleanly: Parakeet was
 # measured rendering "Reachy" as "Rich" / "Richie", and "hey" as "hay"/"eh".
-WAKE_PHRASE = os.environ.get("REACHY_WAKE_PHRASE", "hey")
+WAKE_PHRASE = os.environ.get("REACHY_WAKE_PHRASE", "hi")
 WAKE_PATTERNS = {
+    # "high" has to be accepted -- "Hi Reachy" comes back as "High Regi" -- but
+    # only at the start of an utterance, or "this is high priority" wakes the
+    # robot mid-conversation. Wake words are said first; that anchor costs
+    # almost no recall and removes the common false positive. Bare "hi" is
+    # allowed anywhere, being a greeting rather than an ordinary word.
+    "hi": [r"^\W*(hi|high|hai|hy|hii+)\b", r"\bhi\b", r"\bhai\b"],
     # No bare "ay"/"eh": too loose, and they fire on filler speech.
     "hey": [r"\bhey\b", r"\bhay\b", r"\bhei\b"],
     "hey reachy": [
@@ -211,7 +217,9 @@ WAKE_RE = re.compile(
 )
 
 # Said as "hey reachy ...", the name would otherwise survive into the question.
-NAME_RE = re.compile(r"^(reach\w*|rich\w*|ridge\w*|retch\w*)\b[\s,.!?]*", re.I)
+# Measured renderings of "Reachy": Rich, Richie, Regi, Reggie, Ridge.
+NAME_RE = re.compile(
+    r"^(reach\w*|rich\w*|ridge\w*|retch\w*|reg[gi]\w*|rej\w*)\b[\s,.!?]*", re.I)
 
 # REACHY_NO_WAKE=1 answers every utterance without a wake phrase. Useful for a
 # first end-to-end test, and for a quiet room where you are the only speaker.
@@ -230,8 +238,46 @@ CONVERSATION_WINDOW_S = 25.0
 HISTORY_TURNS = int(os.environ.get("REACHY_HISTORY_TURNS", 12))
 HISTORY_MAX_CHARS = int(os.environ.get("REACHY_HISTORY_MAX_CHARS", 4000))
 SESSION_RESET_S = float(os.environ.get("REACHY_SESSION_RESET", 600))
+
+# Remembered facts that outlive a conversation. Kept in the working directory
+# and gitignored: it is the user's home city, not something to publish.
+STATE_FILE = Path(os.environ.get("REACHY_STATE_FILE", ".agent_state.json"))
+
+# Questions whose answer depends on where you are. Asked without a city these
+# get answered for nowhere in particular, or the model quietly invents one.
+LOCATION_RE = re.compile(
+    r"\b(weather|temperature|forecast|humid\w*|rain\w*|sunny|sunset|sunrise|\n    air quality|aqi|pollution|traffic|local news|near me|around here|nearby|\n    outside|how (?:hot|cold|warm))\b", re.I)
+
+# "weather in Pune", "news for Mumbai". ASR capitalises place names reasonably
+# reliably, which is what makes this workable without a gazetteer.
+CITY_IN_RE = re.compile(
+    r"\b(?:in|at|for|near|around)\s+([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+){0,2})")
+
+# Replies that answer "which city?" with something that is not a city.
+NON_CITY_RE = re.compile(
+    r"\b(never ?mind|forget it|nothing|no|nope|stop|cancel|don't|dont|"
+    r"doesn't matter|whatever|here|home|anywhere|both|you|me|why|what|who)\b",
+    re.I)
+
+# Strip the padding people put around an answer to "which city?"
+CITY_STRIP_RE = re.compile(
+    r"^\W*(?:i(?:'m| am)?\s+(?:in|at|from)\s+|it(?:'s| is)\s+|"
+    r"(?:the\s+)?city\s+(?:is|of)\s+|in\s+|at\s+|for\s+)", re.I)
+
 VISION_INTERVAL_S = float(os.environ.get("REACHY_VISION_INTERVAL", 3.0))
 VISION_MAX_BACKOFF_S = float(os.environ.get("REACHY_VISION_MAX_BACKOFF", 60))
+# Audio must keep arriving; if it stops, the pipeline is dead however
+# healthy the process looks. Also the age past which a frame on disk is
+# treated as stale rather than current.
+AV_STALL_S = float(os.environ.get("REACHY_AV_STALL", 12))
+AV_CHECK_S = float(os.environ.get("REACHY_AV_CHECK", 5))
+# WebRTC negotiation takes seconds, and the robot needs longer still just
+# after waking. Judging health before then kills the pipeline while it is
+# still connecting, and restarting races a new peer against the one being
+# torn down -- which is how a single transient failure became 46 restarts.
+AV_START_GRACE_S = float(os.environ.get("REACHY_AV_GRACE", 25))
+AV_RESTART_BACKOFF_S = float(os.environ.get("REACHY_AV_BACKOFF", 8))
+AV_RESTART_MAX_S = float(os.environ.get("REACHY_AV_BACKOFF_MAX", 60))
 # Captioning is background context, never in the critical path of a reply, so
 # it should give up quickly rather than tie up a worker for 45s.
 VLM_TIMEOUT = float(os.environ.get("REACHY_VLM_TIMEOUT", 12))
@@ -564,7 +610,25 @@ class Brain:
         self._vlm_idx = 0
         self._vlm_fails = 0
 
+    def look(self, jpeg: bytes, question: str) -> str:
+        """Ask the vision model the user's actual question about this frame.
+
+        The rolling caption is generated on a timer with a fixed generic
+        prompt, so it can only answer what it happened to mention -- "what
+        colour is my shirt?" against "a man wearing glasses is sitting in a
+        chair" is unanswerable. This puts the real question and the real pixels
+        in front of the model, and costs ~1.5s on vision turns only.
+        """
+        return self._vlm(jpeg, "Answer this question about the image in one "
+                               "short factual sentence. If the image does not "
+                               f"show it, say so plainly.\n\nQuestion: {question}")
+
     def caption(self, jpeg: bytes) -> str:
+        return self._vlm(jpeg,
+                         "Describe this scene in one short sentence: who is "
+                         "present, what they are doing, and any notable objects.")
+
+    def _vlm(self, jpeg: bytes, prompt: str) -> str:
         import base64
         b64 = base64.b64encode(jpeg).decode()
         model = VLM_FALLBACKS[self._vlm_idx % len(VLM_FALLBACKS)]
@@ -572,9 +636,7 @@ class Brain:
             r = self.http.post("/chat/completions", timeout=VLM_TIMEOUT, json={
                 "model": model, "max_tokens": 70, "temperature": 0.2,
                 "messages": [{"role": "user", "content": [
-                    {"type": "text", "text":
-                        "Describe this scene in one short sentence: who is "
-                        "present, what they are doing, and any notable objects."},
+                    {"type": "text", "text": prompt},
                     {"type": "image_url",
                      "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ]}],
@@ -929,6 +991,8 @@ class RobotAV:
         self.proc: subprocess.Popen | None = None
         self.frames = Path(tempfile.mkdtemp(prefix="reachy_av_"))
         self.audio_q: queue.Queue[bytes] = queue.Queue(maxsize=200)
+        self.last_audio_at = 0.0
+        self.started_at = 0.0
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -959,6 +1023,8 @@ class RobotAV:
             return None
 
     def start(self) -> None:
+        self.started_at = time.time()
+        self.last_audio_at = time.time()      # grace period while it comes up
         pid = self.producer_id()
         if not pid:
             raise RuntimeError(
@@ -1001,6 +1067,7 @@ class RobotAV:
             if len(buf) < FRAME_BYTES:
                 continue
             chunk, buf = buf[:FRAME_BYTES], buf[FRAME_BYTES:]
+            self.last_audio_at = time.time()
             try:
                 self.audio_q.put_nowait(chunk)
             except queue.Full:
@@ -1012,11 +1079,30 @@ class RobotAV:
                 except queue.Empty:
                     pass
 
+    def healthy(self) -> bool:
+        """Is the pipeline actually delivering, not merely started?
+
+        A dead gst leaves its last frames on disk, so the camera looks frozen
+        rather than broken and the captioner happily re-describes a stale
+        image forever. Liveness has to be judged on arriving audio, not on
+        the process having been launched once.
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        if time.time() - self.started_at < AV_START_GRACE_S:
+            return True                       # still negotiating; give it time
+        return (time.time() - self.last_audio_at) < AV_STALL_S
+
     def latest_frame(self) -> bytes | None:
         files = sorted(self.frames.glob("f_*.jpg"))
         # Skip the newest: multifilesink may still be writing it.
         for p in reversed(files[:-1] or files):
             try:
+                # Never hand back a frame the pipeline stopped updating hours
+                # ago: the captioner would keep describing it as if it were
+                # live, which is worse than admitting there is no picture.
+                if time.time() - p.stat().st_mtime > AV_STALL_S:
+                    return None
                 data = p.read_bytes()
                 if data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"):
                     return data
@@ -1588,6 +1674,10 @@ class VoiceAgent:
         # Intent carried forward so a bare "yes" can act on the last request.
         self._pending_intent: dict | None = None
         self._last_turn_at = 0.0
+        self._awaiting_city = False
+        self._pending_question: str | None = None
+        self.location: str | None = None
+        self._load_state()
         self.local_wake: LocalWake | None = None
         if LOCAL_WAKE and not NO_WAKE:
             try:
@@ -1598,6 +1688,39 @@ class VoiceAgent:
                       f"         Every utterance will be sent to cloud ASR to test\n"
                       f"         for the wake word. Install with:\n"
                       f"           .venv/bin/pip install faster-whisper\n", flush=True)
+
+    def _av_watchdog(self) -> None:
+        """Restart the capture pipeline when it dies.
+
+        gst exits on its own -- a broken stdout pipe, the robot rebooting and
+        invalidating the producer id -- and until now nothing noticed: the
+        agent stayed "running" while deaf and blind, still serving the last
+        frame it happened to have on disk. Anything meant to sit in a room for
+        days needs this.
+        """
+        fails = 0
+        while self.running:
+            time.sleep(AV_CHECK_S)
+            if not self.running or self.av.healthy():
+                fails = 0
+                continue
+            fails += 1
+            wait = min(AV_RESTART_MAX_S, AV_RESTART_BACKOFF_S * fails)
+            self.emit("av_down", attempt=fails, backoff=round(wait, 1),
+                      proc_alive=self.av.proc is not None
+                      and self.av.proc.poll() is None)
+            try:
+                self.av.stop()
+            except Exception:
+                pass
+            # Let the robot retire the old peer before offering a new one.
+            time.sleep(wait)
+            try:
+                self.av.start()          # re-resolves the producer id
+                self.emit("av_restarted", backoff=round(wait, 1))
+            except Exception as e:
+                self.emit("error", where="av_restart",
+                          detail=f"{type(e).__name__}: {e}")
 
     def _warm(self) -> None:
         """(Re)warm the speech channels. Cheap, and hides ~2s of setup."""
@@ -1930,6 +2053,83 @@ class VoiceAgent:
                         lambda: self._set_state("idle")).start()
         return True
 
+    def _load_state(self) -> None:
+        try:
+            d = json.loads(STATE_FILE.read_text())
+            self.location = (d.get("location") or "").strip() or None
+        except Exception:
+            self.location = None
+
+    def _save_state(self) -> None:
+        try:
+            STATE_FILE.write_text(json.dumps({"location": self.location}))
+        except Exception:
+            pass          # a remembered city is not worth failing a turn over
+
+    def _resolve_location(self, text: str) -> tuple[str | None, bool]:
+        """Work out what to do with a location-dependent question.
+
+        Returns (text_to_use, handled). `handled` means the turn is finished --
+        the robot asked which city and is waiting for the answer.
+        """
+        # Answering a "which city?" we asked a moment ago.
+        if self._awaiting_city:
+            city = CITY_STRIP_RE.sub("", text).strip(" .,!?")
+            self._awaiting_city = False
+            # Not everything said after "which city?" is a city. Without this,
+            # "never mind" becomes the remembered home town and every later
+            # forecast is fetched for a place that does not exist.
+            plausible = (city and len(city) < 40 and "?" not in city
+                         and len(city.split()) <= 3
+                         and not NON_CITY_RE.search(city))
+            if plausible:
+                self.location = city
+                self._save_state()
+                self.emit("location", city=city, source="asked")
+                pending = self._pending_question or ""
+                self._pending_question = None
+                if pending:
+                    return f"{pending} in {city}", False
+                return f"Thanks. What would you like to know about {city}?", False
+            return text, False
+
+        if not LOCATION_RE.search(text):
+            return text, False
+
+        # A city named in the question wins, and is remembered.
+        m = CITY_IN_RE.search(text)
+        if m:
+            city = m.group(1).strip()
+            if city.lower() not in ("the", "me", "here", "you"):
+                self.location = city
+                self._save_state()
+                self.emit("location", city=city, source="mentioned")
+            return text, False
+
+        if self.location:
+            self.emit("location", city=self.location, source="remembered")
+            return f"{text} in {self.location}", False
+
+        # Nothing to go on: ask, rather than answering for nowhere.
+        self._awaiting_city = True
+        self._pending_question = text
+        self.emit("location", city=None, source="asking")
+        self._speak_now("Which city should I check?")
+        return text, True
+
+    def _speak_now(self, line: str) -> None:
+        try:
+            wav = self.speech.synthesize(line)
+            if not wav:
+                return
+            self._set_state("speaking")
+            dur = play_wav(wav)
+            self._mute_until = time.time() + PLAY_GUARD_S
+            self.awake_until = time.time() + dur + CONVERSATION_WINDOW_S
+            threading.Timer(dur, lambda: self._set_state("idle")).start()
+        except Exception as e:
+            self.emit("error", where="speak", detail=f"{type(e).__name__}: {e}")
+
     def _trim_history(self) -> None:
         """Keep the context bounded for an agent that runs for days.
 
@@ -1952,6 +2152,10 @@ class VoiceAgent:
         self._last_turn_at = time.time()
 
     def _respond(self, text: str) -> None:
+        # Location-dependent questions need a city before anything else.
+        text, handled = self._resolve_location(text)
+        if handled:
+            return
         self._trim_history()
         self.history.append({"role": "user", "content": text})
         self._set_state("thinking")
@@ -1970,13 +2174,34 @@ class VoiceAgent:
                 self._start_filler(text)
 
         def on_tool_done(name, args, result):
-            if name in SLOW_TOOLS:
+            # Must mirror on_tool_start exactly. Starting on INFO_TOOLS but
+            # stopping only on SLOW_TOOLS meant a web_search armed the filler
+            # and nothing ever disarmed it, so the robot kept reciting "still
+            # digging" long after it had given the answer.
+            if name in INFO_TOOLS:
                 self._stop_filler()
             on_tool(name, args, result)
 
         # Supply the camera caption only when the question is about vision, and
         # the movement tools only when movement is actually being asked for.
-        world = self.world if VISION_RE.search(text) else ""
+        world = ""
+        if VISION_RE.search(text):
+            # Put the actual question in front of the actual pixels. Falls back
+            # to the rolling caption if the look fails or there is no frame,
+            # so a flaky VLM degrades rather than breaking the turn.
+            world = self.world
+            frame = self.av.latest_frame()
+            if frame:
+                try:
+                    t_look = time.time()
+                    seen = self.brain.look(frame, text)
+                    if seen:
+                        world = seen
+                        self.emit("looked", took=round(time.time() - t_look, 2),
+                                  saw=seen[:90])
+                except Exception as e:
+                    self.emit("error", where="look",
+                              detail=f"{type(e).__name__}: {e}")
         wants = {"move": bool(MOVE_RE.search(text)),
                  "web": bool(LOOKUP_RE.search(text) or AGENT_RE.search(text)),
                  "agent": bool(AGENT_RE.search(text))}
@@ -2010,10 +2235,17 @@ class VoiceAgent:
                 # fall through to the non-streaming path below
 
         try:
-            answer = self.brain.reply(self.history, world, on_tool=on_tool_done,
-                                      allow_tools=allow,
-                                      on_tool_start=on_tool_start,
-                                      force_tool=force_tool)
+            try:
+                answer = self.brain.reply(self.history, world,
+                                          on_tool=on_tool_done,
+                                          allow_tools=allow,
+                                          on_tool_start=on_tool_start,
+                                          force_tool=force_tool)
+            finally:
+                # Whatever happened -- success, exception, an unexpected tool
+                # name -- the filler stops with the turn. It is a background
+                # thread holding the speaker; it must not outlive its reason.
+                self._stop_filler()
         except Exception as e:
             self.emit("error", where="llm", detail=f"{type(e).__name__}: {e}")
             self._set_state("idle")
@@ -2054,6 +2286,7 @@ class VoiceAgent:
         self.emit("ready",
                   wake="everything" if NO_WAKE else f"say '{WAKE_PHRASE}'")
         threading.Thread(target=self._vision_loop, daemon=True).start()
+        threading.Thread(target=self._av_watchdog, daemon=True).start()
         while self.running:
             got = self._next_utterance()
             if not got:

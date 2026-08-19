@@ -31,3 +31,6 @@ sounds/
 REACHY_HANDOFF.md
 MIC_TEARDOWN_CHECKLIST.md
 .claude/
+
+# Remembered facts (home city)
+.agent_state.json

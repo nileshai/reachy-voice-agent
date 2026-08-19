@@ -204,7 +204,7 @@
   <section>
     <div class="head">Camera <span id="vstat" style="color:#4a554e">—</span></div>
     <div class="video-wrap">
-      <img id="cam" alt="">
+      <img id="cam" alt="" onerror="setTimeout(attachStream, 2000)">
       <div class="placeholder" id="ph">Start the conversation to open the camera</div>
       <div class="caption" id="cap" style="display:none"><b>Seeing</b><span id="capt"></span></div>
     </div>
@@ -253,10 +253,21 @@ async function api(path, opts) {
   return r.json();
 }
 
+let camStalls = 0;
 function attachStream() {
+  camStalls = 0;
   $('cam').src = '/api/voice/stream?t=' + Date.now();
   $('cam').style.display = 'block';
   $('ph').style.display = 'none';
+}
+// If the stream is attached before the pipeline has produced a frame, the
+// <img> stays blank forever: src is set, so the reattach check skips it.
+// Watch for a stalled image and re-request rather than sitting on a black box.
+function checkCamAlive() {
+  const cam = $('cam');
+  if (!running || !cam.src) { camStalls = 0; return; }
+  if (cam.naturalWidth > 0) { camStalls = 0; return; }
+  if (++camStalls >= 6) { sys('camera stalled — reattaching', 'ignored'); attachStream(); }
 }
 function detachStream() {
   $('cam').removeAttribute('src');
@@ -451,6 +462,8 @@ async function pollEvents() {
       if (e.kind === 'heard')        msg('You', e.text, e.secs + 's');
       else if (e.kind === 'reply')   msg('Reachy', e.text, 'llm ' + e.llm_s + 's');
       else if (e.kind === 'wake')    sys('wake detected locally: "' + e.local + '" (' + e.took + 's)', 'wake');
+      else if (e.kind === 'location') sys(e.city ? ('location: ' + e.city + ' (' + e.source + ')') : 'asking which city…', 'wake');
+      else if (e.kind === 'looked')  sys('looked at the camera (' + e.took + 's): ' + e.saw, 'wake');
       else if (e.kind === 'working') sys('looking that up…' + (e.tool === 'run_agent' ? ' (agent — this one is slow)' : ''), 'wake');
       else if (e.kind === 'filler')  sys('…' + e.text, 'ignored');
       else if (e.kind === 'tool')    sys('got a result from ' + e.name, 'ignored');
@@ -469,6 +482,7 @@ async function pollEvents() {
 setInterval(pollStatus, 450);
 setInterval(pollEvents, 700);
 setInterval(pollPower, 2500);   // power state changes slowly; no need to spam
+setInterval(checkCamAlive, 2000);
 pollStatus();
 pollPower();
 </script>
